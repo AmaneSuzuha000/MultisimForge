@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-10-30
+
+Routing release. A wire with no clean path is now a last resort, not the first
+answer: the router escalates, and the builder will nudge a part aside before it
+gives up.
+
+### Changed
+
+- The router tries harder before failing a net: it retries the pin escape at
+  growing clearances, re-runs A* on a denser grid built from interval
+  midpoints, and routes the whole design up to three times with the failing
+  nets moved first (rip-up and retry), keeping the pass with the fewest
+  failures.
+- `build` auto-repairs the layout: when no arrangement of wires fits, it moves
+  one part or one ground symbol by half a grid step at a time (up to 48 tries,
+  3 s budget), keeps the cleanest result, and reports what it moved in
+  `moved_parts` plus a warning line. `--no-auto-repair` restores the strict
+  "fail on the spec as written" behaviour.
+
+### Fixed
+
+- A repaired build no longer hides the reason it was repaired: the move is
+  listed in `warnings`, so the command exits `WARN` rather than `PASS`.
+
 ## [0.1.1] - 2026-10-30
 
 Reliability release. No new user-facing features; the goal is that a failed run

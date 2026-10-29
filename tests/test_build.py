@@ -93,7 +93,7 @@ def test_degraded_routing_is_rejected():
     spec["layout"] = {"V1": [108, 216], "R1": [252, 180], "C1": [252, 196, 90], "XSC1": [300, 130],
                       "GND": [[108, 306], [252, 342], [300, 198]]}
     with pytest.raises(RouteError) as exc:
-        builder.build(spec)
+        builder.build(spec, auto_repair=False)
     assert exc.value.failures, "RouteError must name the failing nets"
     assert not (OUT / "crowded.ms14").exists(), "a rejected build must not leave a file behind"
 
@@ -103,7 +103,21 @@ def test_degraded_routing_can_be_allowed():
     spec["output"] = str(OUT / "crowded_ok.ms14")
     spec["layout"] = {"V1": [108, 216], "R1": [252, 180], "C1": [252, 196, 90], "XSC1": [300, 130],
                       "GND": [[108, 306], [252, 342], [300, 198]]}
-    result = builder.build(spec, allow_fallback=True)
+    result = builder.build(spec, allow_fallback=True, auto_repair=False)
     assert result["degraded"] is True
     assert result["route_failures"]
     assert any("degraded routing" in w for w in result["warnings"])
+
+def test_layout_is_auto_repaired():
+    """A part sitting on top of a ground symbol is nudged aside instead of failing the build."""
+    from multisimforge.router import RouteError
+    spec = json.loads((ROOT / "examples" / "rc_lowpass.json").read_text(encoding="utf-8"))
+    spec["output"] = str(OUT / "repaired.ms14")
+    spec["layout"]["C1"] = [396, 300, 90]                      # overlaps the ground symbol at (396, 342)
+    with pytest.raises(RouteError):
+        builder.build(spec, auto_repair=False)
+    result = builder.build(spec)
+    assert result["moved_parts"], "the repair must report what it moved"
+    assert result["degraded"] is False
+    assert check.check_file(result["ms14"])["problems"] == []
+    assert any("auto-repaired" in w for w in result["warnings"]), result["warnings"]

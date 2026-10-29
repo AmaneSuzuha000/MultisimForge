@@ -86,8 +86,12 @@ def simplify(points):
     return out
 
 
-def route(start, end, obstacles, *, occupied=None):
-    """A* on a sparse grid: turns and crossings with other nets cost extra, overlaps and passing through parts are forbidden."""
+def route(start, end, obstacles, *, occupied=None, dense=0):
+    """A* on a sparse grid: turns and crossings with other nets cost extra, overlaps and passing through parts are forbidden.
+
+    dense=1 inserts the midpoint of every grid interval, which finds corridors
+    that the coarse grid (built only from part edges +-9) can miss.
+    """
     occupied = occupied or []
     boxes = [rectangle(o) for o in obstacles]
     for p in (start, end):
@@ -120,6 +124,9 @@ def route(start, end, obstacles, *, occupied=None):
     xs.update((min(xs) - 18, max(xs) + 18))
     ys.update((min(ys) - 18, max(ys) + 18))
     xx, yy = sorted(xs), sorted(ys)
+    if dense:
+        xx = sorted(set(xx) | {(a + b) / 2 for a, b in zip(xx, xx[1:])})
+        yy = sorted(set(yy) | {(a + b) / 2 for a, b in zip(yy, yy[1:])})
     first = (bisect_left(xx, start[0]), bisect_left(yy, start[1]), 0)
     target = (bisect_left(xx, end[0]), bisect_left(yy, end[1]))
     dist, parent = {first: 0.0}, {}
@@ -172,14 +179,35 @@ def route(start, end, obstacles, *, occupied=None):
 
 
 def route_pins(start, end, obstacles, occupied=None):
+    """Route pin to pin, escalating before giving up.
+
+    The pin must leave the part body along its direction. The first clearance may
+    land in a neighbouring part, so the same attempt is repeated with a longer
+    escape, then on a denser A* grid. Only when every combination fails does the
+    caller hear a reason.
+    """
     a, b = (float(start["x"]), float(start["y"])), (float(end["x"]), float(end["y"]))
-    ea, eb = pin_escape(start, obstacles), pin_escape(end, obstacles)
-    for p, e, conn in ((a, ea, start), (b, eb, end)):
-        if any(o.get("owner", o.get("refdes")) != conn.get("refdes") and crosses_box(p, e, rectangle(o)) for o in obstacles):
-            raise ValueError("pin escape crosses another part")
-        if any(segment_relation(p, e, c, d) == "overlap" for c, d in occupied or []):
-            raise ValueError("pin escape overlaps another net")
-    return simplify([a, *route(ea, eb, obstacles, occupied=occupied), b])
+    first_error = None
+    for clearance in (9, 18, 27, 40):
+        ea, eb = pin_escape(start, obstacles, clearance), pin_escape(end, obstacles, clearance)
+        bad = False
+        for p, e, conn in ((a, ea, start), (b, eb, end)):
+            if any(o.get("owner", o.get("refdes")) != conn.get("refdes") and crosses_box(p, e, rectangle(o)) for o in obstacles):
+                first_error = first_error or "pin escape crosses another part"
+                bad = True
+                break
+            if any(segment_relation(p, e, c, d) == "overlap" for c, d in occupied or []):
+                first_error = first_error or "pin escape overlaps another net"
+                bad = True
+                break
+        if bad:
+            continue
+        for dense in (False, True):
+            try:
+                return simplify([a, *route(ea, eb, obstacles, occupied=occupied, dense=dense), b])
+            except ValueError as exc:
+                first_error = first_error or str(exc)
+    raise ValueError(first_error or "no obstacle-free path")
 
 
 # ---------------------------------------------------------------------------
@@ -332,21 +360,40 @@ def route_all(connections, boxes, labels=()):
         return (max(xs) - min(xs)) + (max(ys) - min(ys))
 
     islands.sort(key=span)
-    result, occupied, failures = [], [], []
-    for name, conns in islands:
-        mine = {id(c) for c in conns}
-        obstacles = list(boxes) + list(labels)
-        for other in connections.values():          # leave escape channels for the other pins
-            for pin in other:
-                if id(pin) in mine:
-                    continue
-                ex, ey = pin_escape(pin, boxes)
-                px, py = float(pin["x"]), float(pin["y"])
-                obstacles.append({"refdes": "__pin__", "x": min(px, ex) - 3, "y": min(py, ey) - 3,
-                                  "width": abs(px - ex) + 6, "height": abs(py - ey) + 6})
-        edges, junctions, fb = route_island(conns, obstacles, boxes, occupied)
-        failures += [{"net": name, "reason": reason} for reason in fb]
-        for e in edges:
-            occupied.extend(_segments(e["path"]))
-        result.append((name, conns, edges, junctions))
-    return result, failures
+
+    def one_pass(order):
+        result, occupied, failures = [], [], []
+        for name, conns in order:
+            mine = {id(c) for c in conns}
+            obstacles = list(boxes) + list(labels)
+            for other in connections.values():          # leave escape channels for the other pins
+                for pin in other:
+                    if id(pin) in mine:
+                        continue
+                    ex, ey = pin_escape(pin, boxes)
+                    px, py = float(pin["x"]), float(pin["y"])
+                    obstacles.append({"refdes": "__pin__", "x": min(px, ex) - 3, "y": min(py, ey) - 3,
+                                      "width": abs(px - ex) + 6, "height": abs(py - ey) + 6})
+            edges, junctions, fb = route_island(conns, obstacles, boxes, occupied)
+            failures += [{"net": name, "reason": reason} for reason in fb]
+            for e in edges:
+                occupied.extend(_segments(e["path"]))
+            result.append((name, conns, edges, junctions))
+        return result, failures
+
+    # Rip-up and retry: earlier nets occupy space, so a later one may fail only
+    # because of the order. Re-run with the failing nets first, then reversed,
+    # and keep the pass with the fewest failures.
+    order = list(islands)
+    best = None
+    for attempt in range(3):
+        result, failures = one_pass(order)
+        if best is None or len(failures) < len(best[1]):
+            best = (result, failures)
+        if not failures:
+            return result, []
+        failed = {f["net"] for f in failures}
+        order = [i for i in order if i[0] in failed] + [i for i in order if i[0] not in failed]
+        if attempt == 1:
+            order = list(reversed(order))
+    return best

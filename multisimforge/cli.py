@@ -78,7 +78,7 @@ def cmd_build(a):
     from .router import RouteError
     spec = json.loads(Path(a.spec).read_text(encoding="utf-8"))
     try:
-        r = builder.build(spec, allow_fallback=a.allow_fallback)
+        r = builder.build(spec, allow_fallback=a.allow_fallback, auto_repair=not a.no_auto_repair)
     except RouteError as exc:
         return {"problems": [str(exc)], "route_failures": exc.failures, "warnings": [],
                 "degraded": False}, Status.FAIL
@@ -92,6 +92,7 @@ def cmd_build(a):
         "problems": report["problems"],
         "degraded": r.get("degraded", False),
         "route_failures": r.get("route_failures", []),
+        "moved_parts": r.get("moved_parts", {}),
         "placements": {p["refdes"]: p["box"] for p in r["placements"]},
     }
     if a.preview:
@@ -196,6 +197,8 @@ def main(argv=None):
     s = sub.add_parser("build", help="build a .ms14 from spec.json and self-check it")
     s.add_argument("spec")
     s.add_argument("--preview", help="also export a preview image PNG")
+    s.add_argument("--no-auto-repair", action="store_true",
+                   help="fail on the spec as written instead of nudging parts aside to make it routable")
     s.add_argument("--allow-fallback", action="store_true",
                    help="allow degraded routing (a wire that has no obstacle-free path) instead of failing")
     s.set_defaults(func=cmd_build)

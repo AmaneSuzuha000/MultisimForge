@@ -13,9 +13,11 @@ spec fields:
                  every endpoint must land on a pin centre or coincide with another polyline, segments must be horizontal/vertical
     sheet        sheet size [width, height] in inches; defaults to a tight fit around the circuit
 """
+import json
 import math
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -855,14 +857,95 @@ def _layout_key(layout: dict, refdes: str):
     return None
 
 
-def build(spec: dict, lib: Library | None = None, allow_fallback: bool = False) -> dict:
-    """Build a .ms14 from a spec.
+def build(spec: dict, lib: Library | None = None, allow_fallback: bool = False,
+          auto_repair: bool = True, max_repairs: int = 48, repair_budget_s: float = 3.0) -> dict:
+    """Build a .ms14 from a spec, trying to make the layout routable before failing.
 
-    Degraded routing (a wire with no obstacle-free path) is an error by default:
-    raise RouteError and write nothing. Pass allow_fallback=True to accept it;
-    the result then carries degraded=True and the failing nets.
+    Degraded routing (a wire with no obstacle-free path) is an error. Before
+    raising, the builder retries with one part or ground symbol nudged aside
+    (auto_repair); the arrangement that routes cleanest wins and every move is
+    reported in moved_parts. Pass auto_repair=False to fail on the spec exactly
+    as given, or allow_fallback=True to accept a degraded drawing instead.
     """
     lib = lib or Library()
+    try:
+        return _build_once(spec, lib, allow_fallback)
+    except RouteError:
+        if allow_fallback or not auto_repair:
+            raise
+        best = None
+        deadline = time.monotonic() + repair_budget_s
+        for candidate, moves in _repair_variants(spec, max_repairs):
+            if time.monotonic() > deadline:
+                break                              # keep a failing build fast; report the best attempt so far
+            try:
+                result = _build_once(candidate, lib, allow_fallback)
+            except RouteError:
+                continue
+            result["moved_parts"] = moves
+            moved = ", ".join(f"{name} by ({dx:+g},{dy:+g})" for name, (dx, dy) in moves.items())
+            result["warnings"] = list(result["warnings"]) + [f"layout auto-repaired: moved {moved} so the router could pass"]
+            score = _repair_score(result)
+            if score == 0:
+                return result                      # routed cleanly with nothing left to report
+            if best is None or score < best[0]:
+                best = (score, result)
+        if best is not None:
+            return best[1]
+        raise
+
+
+def _repair_score(result: dict) -> int:
+    """How much is still wrong with a repaired build: problems first, then crossings, then warnings."""
+    from . import check
+    report = check.check_file(result["ms14"], result.get("expected"))
+    return len(report["problems"]) * 1000 + len(report["warnings"]) * 10 + len(result["warnings"]) - 1
+
+
+def _repair_variants(spec: dict, limit: int):
+    """Yield (spec_with_moved_parts, {label: (dx, dy)}) for small layout nudges.
+
+    Ground symbols come first (small, and the usual blocker when a part is placed
+    over one), then the parts; instruments never move. Offsets escalate from half
+    a grid step to four, in both axes.
+    """
+    layout = spec.get("layout") or {}
+    targets = [("GND", index) for index in range(len(layout.get("GND") or []))]
+    targets += [("part", name) for name, pos in layout.items()
+                if isinstance(pos, list) and len(pos) >= 2 and isinstance(pos[0], (int, float))
+                and str(name).upper() != "GND" and not str(name).upper().startswith("X")]
+    offsets = [(0, 12), (0, -12), (12, 0), (-12, 0), (0, 24), (0, -24), (24, 0), (-24, 0),
+               (0, 36), (0, -36), (36, 0), (-36, 0)]
+    boxes = []
+    for name, pos in layout.items():
+        if isinstance(pos, list) and len(pos) >= 2 and isinstance(pos[0], (int, float)) and str(name).upper() != "GND":
+            boxes.append((float(pos[0]), float(pos[1]), 126.0, 108.0))
+    made = 0
+    for kind, key in targets:
+        for dx, dy in offsets:
+            if made >= limit:
+                return
+            candidate = json.loads(json.dumps(spec))
+            if kind == "GND":
+                point = list(candidate["layout"]["GND"][key])
+                point[0] = float(point[0]) + dx
+                point[1] = float(point[1]) + dy
+                candidate["layout"]["GND"][key] = point
+                label = f"GND[{key}]"
+            else:
+                pos = list(candidate["layout"][key])
+                pos[0] = float(pos[0]) + dx
+                pos[1] = float(pos[1]) + dy
+                candidate["layout"][key] = pos
+                label = key
+            point = candidate["layout"]["GND"][key] if kind == "GND" else candidate["layout"][key]
+            if kind == "GND" and any(x < point[0] < x + w and y < point[1] < y + h for x, y, w, h in boxes):
+                continue                       # a symbol dropped inside a part cannot help; skip without building
+            made += 1
+            yield candidate, {label: (dx, dy)}
+
+
+def _build_once(spec: dict, lib: Library, allow_fallback: bool) -> dict:
     run_id = new_run_id()
     out = Path(spec["output"]).resolve()
     if not re.fullmatch(r"[A-Za-z0-9_\-]+", out.stem) or out.suffix.lower() != ".ms14":

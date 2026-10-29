@@ -30,7 +30,7 @@ for sub in ("specs", "captures", "tmp"):
 mcp = MCPServer(
     "multisimforge",
     title="MultisimForge",
-    version="0.1.1",
+    version="0.1.2",
     instructions=(
         "MultisimForge adapter for NI Multisim 14.3. Use check_design for offline "
         "connectivity/layout verification, inspect_design to read an existing .ms14, "

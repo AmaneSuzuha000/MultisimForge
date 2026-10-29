@@ -91,14 +91,27 @@ Every command prints one JSON envelope with a `status` and the matching `exit_co
 
 A non-empty `problems` means the drawing disagrees with the netlist and must be fixed; `warnings` are layout advice (too many crossings, detours).
 
-### Routing is strict by default
+### Routing
 
-If a net has no obstacle-free path, `build` fails with `RouteError` and writes
-nothing — it will not quietly draw a wire through a component. Move parts to
-leave a channel, or accept the compromise explicitly:
+The router looks for a clean path before it reports a problem. It retries the
+pin escape at growing clearances, falls back to a denser A* grid, and routes the
+design up to three times with the failing nets moved first (rip-up and retry).
+
+If a net still has no obstacle-free path, `build` tries to repair the layout:
+it moves one part or one ground symbol by half a grid step (up to 48 tries, 3 s)
+and keeps the cleanest result. The move is reported, so the run is `WARN`:
+
+```json
+{"status": "WARN", "moved_parts": {"GND[1]": [0, 24]},
+ "warnings": ["layout auto-repaired: moved GND[1] by (+0,+24) so the router could pass"]}
+```
+
+If no arrangement routes cleanly, `build` fails with `RouteError` and writes
+nothing — it will not quietly draw a wire through a component. Two escape hatches:
 
 ```powershell
-MultisimForge build examples/rc_lowpass.json --allow-fallback   # status WARN, degraded: true
+MultisimForge build design.json --no-auto-repair      # fail on the spec exactly as written
+MultisimForge build design.json --allow-fallback      # status WARN, degraded: true
 ```
 
 ## Explicit wiring
