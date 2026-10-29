@@ -28,7 +28,7 @@ jobs:
 
   # Full suite, including circuit building, on a machine with Multisim.
   native:
-    if: github.event_name == workflow_dispatch
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, windows, multisim]
     steps:
       - uses: actions/checkout@v4
