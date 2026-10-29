@@ -9,6 +9,7 @@ Output:
 """
 import ctypes
 import re
+import hashlib
 import subprocess
 import time
 from pathlib import Path
@@ -31,6 +32,14 @@ PANEL_HINTS = ("XSC", "XBP", "XFG", "XMM", "\u793a\u6ce2\u5668", "\u6ce2\u7279",
                "Oscilloscope", "Bode", "Function", "Multimeter")
 
 
+class NetlistError(RuntimeError):
+    """Multisim refused to build the circuit it was about to simulate."""
+
+    def __init__(self, dialog: dict):
+        self.dialog = dialog
+        super().__init__("Multisim reported a netlist error: " + (dialog.get("text") or dialog.get("title") or "unknown"))
+
+
 def top_windows(pid=None):
     found = []
 
@@ -44,11 +53,18 @@ def top_windows(pid=None):
     return found
 
 
-def find_main(stem: str):
-    for hwnd, title, cls, pid in top_windows():
-        if cls.startswith("Multisim") and f"[{stem}]" in title:
-            return hwnd, pid
-    return None, None
+def find_main(stem: str, candidates: list | None = None):
+    """Main window for a design name.
+
+    Titles only carry the file stem, so two different folders holding the same
+    file name are indistinguishable from the title alone. Every candidate is
+    returned in *candidates*; the caller decides whether the design is ambiguous.
+    """
+    found = [(hwnd, pid) for hwnd, title, cls, pid in top_windows()
+             if cls.startswith("Multisim") and f"[{stem}]" in title]
+    if candidates is not None:
+        candidates[:] = found
+    return (found[0] if found else (None, None))
 
 
 def grab(hwnd: int) -> Image.Image:
@@ -108,19 +124,30 @@ def send_key(hwnd: int, vk: int):
     win32api.PostMessage(target, win32con.WM_KEYUP, vk, 0xC0000000)
 
 
-def dismiss_netlist_warning(pid: int) -> bool:
-    """When Multisim 14.3 opens/runs a generated design it may pop up "Netlist error, continue anyway?";
-    the error details do not block the simulation, so click "Yes" to continue (older versions do not show this dialog)."""
+def dismiss_netlist_warning(pid: int) -> dict:
+    """Detect the "Netlist error, continue anyway?" dialog.
+
+    Returns {"found": bool, "clicked": bool, "title": str, "text": str}. Clicking
+    "Yes" only dismisses the dialog: a netlist error means Multisim could not
+    build the circuit it is about to simulate, so the caller must treat it as a
+    failed run unless the user explicitly allowed continuing.
+    """
     for hwnd, title, cls, _ in top_windows(pid):
         if title != "\u7f51\u8868\u9519\u8bef":
             continue
+        text = []
+        win32gui.EnumChildWindows(
+            hwnd, lambda h, _: text.append(win32gui.GetWindowText(h)) if win32gui.GetWindowText(h) else None, None)
         buttons = []
         win32gui.EnumChildWindows(
             hwnd, lambda h, _: buttons.append(h) if win32gui.GetWindowText(h).startswith("\u662f") else None, None)
+        clicked = False
         for button in buttons:
             win32api.PostMessage(button, win32con.BM_CLICK, 0, 0)
-            return True
-    return False
+            clicked = True
+            break
+        return {"found": True, "clicked": clicked, "title": title, "text": " | ".join(text)[:2000]}
+    return {"found": False, "clicked": False, "title": "", "text": ""}
 
 
 def panels(pid: int, main: int):
@@ -251,7 +278,13 @@ def arrange_panels(main: int, pid: int, view: Image.Image):
 
 def open_design(ms14: Path):
     """Return (main window, process ID, whether it was launched by this call)."""
-    main, pid = find_main(ms14.stem)
+    candidates = []
+    main, pid = find_main(ms14.stem, candidates)
+    if len(candidates) > 1:
+        raise RuntimeError(
+            f"{len(candidates)} Multisim windows are open for a design named {ms14.stem!r} "
+            f"(pids {sorted({p for _, p in candidates})}); close the others first so the capture cannot "
+            f"pick a different file with the same name")
     launched = main is None
     if launched:
         subprocess.Popen([CONFIG["multisim_exe"], str(ms14)])
@@ -269,14 +302,18 @@ def open_design(ms14: Path):
     return main, pid, launched
 
 
-def run_once(ms14: Path, out: Path, wait: float, timeout: float):
+def run_once(ms14: Path, out: Path, wait: float, timeout: float, on_netlist_error: str = "abort"):
     stem = ms14.stem
     main, pid, launched = open_design(ms14)
-    result = {"ms14": str(ms14), "images": {}, "warnings": []}
+    result = {"ms14": str(ms14), "images": {}, "warnings": [], "netlist_errors": []}
     send_key(main, win32con.VK_F5)
     deadline = time.time() + 15
     while not panels(pid, main) and time.time() < deadline:
-        dismiss_netlist_warning(pid)
+        dialog = dismiss_netlist_warning(pid)
+        if dialog["found"]:
+            result["netlist_errors"].append(dialog)
+            if on_netlist_error == "abort":
+                raise NetlistError(dialog)
         time.sleep(0.5)
     if not panels(pid, main):
         result["warnings"].append("No instrument panels appeared after running: check the instruments' show settings")
@@ -285,7 +322,11 @@ def run_once(ms14: Path, out: Path, wait: float, timeout: float):
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(0.7)
-        dismiss_netlist_warning(pid)
+        dialog = dismiss_netlist_warning(pid)
+        if dialog["found"]:
+            result["netlist_errors"].append(dialog)
+            if on_netlist_error == "abort":
+                raise NetlistError(dialog)
         shots = [np.asarray(grab(h)) for h, _ in panels(pid, main)]
         same = previous is not None and len(shots) == len(previous) and all(
             a.shape == b.shape and (a == b).all() for a, b in zip(shots, previous))
@@ -343,26 +384,70 @@ def sweep_info(ms14: Path):
     return sim_time, sweep
 
 
-def capture(ms14, outdir, wait=1.5, timeout=90, keep_open=False) -> dict:
+
+def _close(pid: int, main=None) -> None:
+    """Close Multisim politely first; force-kill only what refuses to go away."""
+    try:
+        if main:
+            win32api.PostMessage(main, win32con.WM_CLOSE, 0, 0)
+    except Exception:
+        pass
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        if not any(p == pid for _, _, _, p in top_windows()):
+            return
+        time.sleep(0.5)
+    subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+
+
+def capture(ms14, outdir, wait=1.5, timeout=90, keep_open=False, on_netlist_error="abort") -> dict:
+    """Capture a real Multisim run.
+
+    The input design is never modified: every run works on a copy inside
+    work/capture/<run_id>/. A netlist error makes the run fail unless
+    on_netlist_error="continue"; the dialog is always recorded in the result.
+    """
     from .builder import set_sim_time
     from . import com
+    from .result import new_run_id
+
     com.stop()                       # release the hidden COM instance first: only one Multisim may run
-    ms14, out = Path(ms14).resolve(), Path(outdir).resolve()
+    source, out = Path(ms14).resolve(), Path(outdir).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    sim_time, sweep = sweep_info(ms14)
-    result, pid, launched, worst = run_once(ms14, out, wait, timeout)
+    run_id = new_run_id()
+    work = Path(CONFIG["work_dir"]) / "capture" / run_id
+    work.mkdir(parents=True, exist_ok=True)
+    copy = work / source.name
+    copy.write_bytes(source.read_bytes())
+    input_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    sim_time, sweep = sweep_info(copy)
+    result, pid, launched, worst = run_once(copy, out, wait, timeout, on_netlist_error)
     if worst < 0.9 and launched and sim_time and sweep and sim_time < 1e20:
         # The sweep start is fixed for a given circuit: extend the end time until this screen is almost fully swept, then run again
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+        _close(pid)
         time.sleep(2)
         new_time = sim_time + (0.99 - worst) * sweep
-        set_sim_time(ms14, new_time)
+        set_sim_time(copy, new_time)          # only the working copy is retimed
         first = result
-        result, pid, launched, worst = run_once(ms14, out, wait, timeout)
+        result, pid, launched, worst = run_once(copy, out, wait, timeout, on_netlist_error)
         result["warnings"] = first["warnings"] + result["warnings"]
+        result["netlist_errors"] = first["netlist_errors"] + result["netlist_errors"]
         result["sim_time_adjusted"] = new_time
     if worst < 0.9:
         result["warnings"].append(f"Oscilloscope waveform covers only {worst:.0%} of the screen; increase sim_time, then regenerate and re-capture")
     if launched and not keep_open:
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+        _close(pid)
+
+    after_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    result.update({
+        "run_id": run_id,
+        "source": str(source),
+        "input_sha256": input_sha,
+        "input_unchanged": input_sha == after_sha,
+        "working_copy": str(copy),
+        "on_netlist_error": on_netlist_error,
+    })
+    if input_sha != after_sha:
+        raise RuntimeError(f"the input design changed during capture ({source}); this is a bug, the run is not trustworthy")
     return result

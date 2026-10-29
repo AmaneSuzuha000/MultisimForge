@@ -1,19 +1,26 @@
-"""multisimforge command-line entry point. All commands print their results as JSON to standard output."""
+"""multisimforge command-line entry point.
+
+Every command prints one JSON envelope to stdout and exits with the code that
+matches its status (see multisimforge/result.py): 0 PASS/WARN, 2 FAIL, 1 ERROR.
+"""
 import argparse
 import json
 import sys
 from pathlib import Path
 
+from .result import Status, exit_code_for, worst
 
-def _out(obj):
-    print(json.dumps(obj, ensure_ascii=False, indent=1, default=str))
+
+def _out(payload, status=Status.PASS):
+    from .result import envelope
+    print(json.dumps(envelope(payload, status), ensure_ascii=False, indent=1, default=str))
 
 
 def _floats(text, n=None):
     from .netlist import parse_value
     vals = [parse_value(t) for t in text.split(",") if t.strip()]
     if n and len(vals) not in n:
-        raise SystemExit(f"Wrong number of values in argument {text!r}")
+        raise ValueError(f"wrong number of values in argument {text!r}")
     return vals
 
 
@@ -22,27 +29,26 @@ def cmd_parts(a):
     lib = parts.Library()
     if a.action == "init":
         r = parts.init_library(lib)
-        _out({"library": str(lib.path), "added": len(r["added"]), "failed": r["failed"]})
-    elif a.action == "list":
+        status = Status.WARN if r["failed"] else Status.PASS
+        return {"library": str(lib.path), "added": len(r["added"]), "failed": r["failed"]}, status
+    if a.action == "list":
         rows = [f"{n}  [{i['family']}]  {' '.join(i['pins'])}" for n, i in lib.search(a.arg or "")]
-        _out({"count": len(rows), "parts": rows})
-    elif a.action == "show":
+        return {"count": len(rows), "parts": rows}, Status.PASS
+    if a.action == "show":
         key = lib.resolve(a.arg or "")
         if key is None:
-            raise SystemExit(f"Part not found in the library: {a.arg!r} (try `parts fetch {a.arg}`)")
+            raise KeyError(f"part not found in the library: {a.arg!r} (try 'multisimforge parts fetch {a.arg}')")
         pin_xy, body = _pin_xy(lib, key)
-        _out({"name": key, **lib.index[key], "pin_xy": pin_xy, "body": body})
-    elif a.action == "harvest":
-        r = parts.harvest_path(Path(a.arg), lib, force=a.force)
-        _out(r)
-    elif a.action == "fetch":
-        _out(parts.fetch(a.arg, lib, group=a.group, family=a.family))
-    elif a.action == "dbindex":
-        _out(parts.build_db_index(lib))
+        return {"name": key, **lib.index[key], "pin_xy": pin_xy, "body": body}, Status.PASS
+    if a.action == "harvest":
+        return parts.harvest_path(Path(a.arg), lib, force=a.force), Status.PASS
+    if a.action == "fetch":
+        return parts.fetch(a.arg, lib, group=a.group, family=a.family), Status.PASS
+    return parts.build_db_index(lib), Status.PASS
 
 
 def _pin_xy(lib, key):
-    """Pin coordinates relative to the pin center and lead directions at 0° placement, plus the symbol body extent, for layout planning."""
+    """Pin coordinates relative to the pin center and lead directions at 0 deg, plus the symbol body extent."""
     from . import builder, check, parts, xmlio
     part = lib.load(key)
     items = part.find("Items")
@@ -69,35 +75,50 @@ def _pin_xy(lib, key):
 
 def cmd_build(a):
     from . import builder, check, com
+    from .router import RouteError
     spec = json.loads(Path(a.spec).read_text(encoding="utf-8"))
-    r = builder.build(spec)
+    try:
+        r = builder.build(spec, allow_fallback=a.allow_fallback)
+    except RouteError as exc:
+        return {"problems": [str(exc)], "route_failures": exc.failures, "warnings": [],
+                "degraded": False}, Status.FAIL
     report = check.check_file(r["ms14"], r.get("expected"))
-    out = {"ms14": r["ms14"], "sim_time": r["sim_time"], "warnings": r["warnings"] + report["warnings"],
-           "problems": report["problems"], "placements": {p["refdes"]: p["box"] for p in r["placements"]}}
+    warnings = r["warnings"] + report["warnings"]
+    payload = {
+        "ms14": r["ms14"],
+        "run_id": r.get("run_id"),
+        "sim_time": r["sim_time"],
+        "warnings": warnings,
+        "problems": report["problems"],
+        "degraded": r.get("degraded", False),
+        "route_failures": r.get("route_failures", []),
+        "placements": {p["refdes"]: p["box"] for p in r["placements"]},
+    }
     if a.preview:
         com.call({"op": "image", "ms14": r["ms14"], "out": str(Path(a.preview).resolve())})
-        out["preview"] = str(Path(a.preview).resolve())
-    _out(out)
+        payload["preview"] = str(Path(a.preview).resolve())
     if report["problems"]:
-        sys.exit(2)
+        return payload, Status.FAIL
+    return payload, (Status.WARN if warnings else Status.PASS)
 
 
 def cmd_preview(a):
     from . import com
-    _out(com.call({"op": "image", "ms14": str(Path(a.ms14).resolve()), "out": str(Path(a.png).resolve())}))
+    r = com.call({"op": "image", "ms14": str(Path(a.ms14).resolve()), "out": str(Path(a.png).resolve())})
+    return r, (Status.WARN if r.get("last_error") else Status.PASS)
 
 
 def cmd_check(a):
     from . import check
     r = check.check_file(a.ms14)
-    _out(r)
     if r["problems"]:
-        sys.exit(2)
+        return r, Status.FAIL
+    return r, (Status.WARN if r["warnings"] else Status.PASS)
 
 
 def cmd_inspect(a):
     from . import check
-    _out(check.inspect(a.ms14))
+    return check.inspect(a.ms14), Status.PASS
 
 
 def cmd_sim(a):
@@ -112,9 +133,10 @@ def cmd_sim(a):
         v = _floats(a.tran, (1, 2))
         tran = (v[0], v[1] if len(v) > 1 else None)
     if not (a.op or ac or tran):
-        raise SystemExit("Choose at least one analysis: --op / --ac / --tran")
-    _out(sim.run(a.ms14, nets, op=a.op, ac=ac, tran=tran, ac_out=a.out, ac_in=getattr(a, "in"),
-                 at=_floats(a.at) if a.at else (), csv_dir=a.csv))
+        raise ValueError("choose at least one analysis: --op / --ac / --tran")
+    r = sim.run(a.ms14, nets, op=a.op, ac=ac, tran=tran, ac_out=a.out, ac_in=getattr(a, "in"),
+                at=_floats(a.at) if a.at else (), csv_dir=a.csv)
+    return r, Status.PASS
 
 
 def cmd_spice(a):
@@ -124,42 +146,43 @@ def cmd_spice(a):
     if vectors:
         r["vectors"] = {k: {"points": len(v), "first": v[0] if not isinstance(v[0], complex) else str(v[0]),
                             "last": v[-1] if not isinstance(v[-1], complex) else str(v[-1])} for k, v in vectors.items()}
-    _out(r)
+    return r, Status.PASS
 
 
 def cmd_capture(a):
     from . import capture
-    _out(capture.capture(a.ms14, a.outdir, wait=a.wait, timeout=a.timeout, keep_open=a.keep_open))
+    r = capture.capture(a.ms14, a.outdir, wait=a.wait, timeout=a.timeout, keep_open=a.keep_open,
+                        on_netlist_error=a.on_netlist_error)
+    return r, (Status.WARN if r.get("warnings") else Status.PASS)
 
 
 def cmd_sim_time(a):
     from . import builder
     from .netlist import parse_value
-    builder.set_sim_time(a.ms14, parse_value(a.seconds))
-    _out({"ms14": a.ms14, "sim_time": parse_value(a.seconds)})
+    value = parse_value(a.seconds)
+    builder.set_sim_time(a.ms14, value)
+    return {"ms14": a.ms14, "sim_time": value}, Status.PASS
 
 
 def cmd_com(a):
     from . import com
     if a.action == "status":
-        _out(com.status())
-    elif a.action == "stop":
-        _out({"stopped": com.stop()})
-    else:
-        raise SystemExit("com only supports status / stop")
+        return com.status(), Status.PASS
+    return {"stopped": com.stop()}, Status.PASS
 
 
 def cmd_codec(a):
     from . import codec
     data = Path(a.src).read_bytes()
     Path(a.dst).write_bytes(codec.decode(data) if a.command == "decode" else codec.encode(data))
-    _out({"written": a.dst})
+    return {"written": a.dst}, Status.PASS
 
 
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8")
-    p = argparse.ArgumentParser(prog="multisimforge", description="Control NI Multisim 14 in text: generate circuits, preview, run simulations and read data, take real screenshots")
+    p = argparse.ArgumentParser(prog="multisimforge",
+                                description="Control NI Multisim 14 in text: generate circuits, preview, run simulations and read data, take real screenshots")
     sub = p.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("parts", help="Part library: init to create / list to search / show details / harvest to collect / fetch from database")
@@ -173,6 +196,8 @@ def main(argv=None):
     s = sub.add_parser("build", help="build a .ms14 from spec.json and self-check it")
     s.add_argument("spec")
     s.add_argument("--preview", help="also export a preview image PNG")
+    s.add_argument("--allow-fallback", action="store_true",
+                   help="allow degraded routing (a wire that has no obstacle-free path) instead of failing")
     s.set_defaults(func=cmd_build)
 
     s = sub.add_parser("preview", help="export the circuit diagram as PNG using Multisim")
@@ -211,6 +236,8 @@ def main(argv=None):
     s.add_argument("--wait", type=float, default=1.5, help="how long the display must be still to consider the simulation finished (seconds)")
     s.add_argument("--timeout", type=float, default=90, help="maximum wait (seconds)")
     s.add_argument("--keep-open", action="store_true", help="do not close Multisim after capturing")
+    s.add_argument("--on-netlist-error", choices=["abort", "continue"], default="abort",
+                   help="what to do when Multisim reports a netlist error (default: abort and fail)")
     s.set_defaults(func=cmd_capture)
 
     s = sub.add_parser("set-sim-time", help="change the interactive simulation end time")
@@ -223,17 +250,23 @@ def main(argv=None):
     s.set_defaults(func=cmd_com)
 
     for name in ("decode", "encode"):
-        s = sub.add_parser(name, help=".ms14 ↔ XML (for debugging)")
+        s = sub.add_parser(name, help=".ms14 <-> XML (for debugging)")
         s.add_argument("src")
         s.add_argument("dst")
         s.set_defaults(func=cmd_codec)
 
     a = p.parse_args(argv)
     try:
-        a.func(a)
+        payload, status = a.func(a)
+    except KeyboardInterrupt:
+        _out({"error": "cancelled"}, Status.CANCELLED)
+        sys.exit(exit_code_for(Status.CANCELLED))
     except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
-        _out({"error": f"{type(exc).__name__}: {exc}"})
-        sys.exit(1)
+        _out({"error": f"{type(exc).__name__}: {exc}"}, Status.ERROR)
+        sys.exit(exit_code_for(Status.ERROR))
+    status = worst([status])
+    _out(payload, status)
+    sys.exit(exit_code_for(status))
 
 
 if __name__ == "__main__":

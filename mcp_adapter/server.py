@@ -30,7 +30,7 @@ for sub in ("specs", "captures", "tmp"):
 mcp = MCPServer(
     "multisimforge",
     title="MultisimForge",
-    version="0.1.0",
+    version="0.1.1",
     instructions=(
         "MultisimForge adapter for NI Multisim 14.3. Use check_design for offline "
         "connectivity/layout verification, inspect_design to read an existing .ms14, "
@@ -39,6 +39,11 @@ mcp = MCPServer(
         "for .ms14<->XML. All paths may be absolute or relative to the adapter directory."
     ),
 )
+
+
+def _python32_cmd(value: str) -> list[str]:
+    """Split the launcher form 'py -3-32'; a real executable path (even with spaces) stays one element."""
+    return value.split() if value.startswith(("py ", "py.exe ")) else [value]
 
 
 def _load_config() -> dict[str, Any]:
@@ -82,18 +87,30 @@ def _run_cli(args: list[str], timeout_s: float = 300) -> dict[str, Any]:
             parsed = json.loads(text)
         except json.JSONDecodeError:
             parsed = None
+    status = parsed.get("status") if isinstance(parsed, dict) else None
+    problems = parsed.get("problems") if isinstance(parsed, dict) else None
     error = None
     if parsed is None:
         error = f"CLI produced no JSON (exit={code})"
+    elif code != 0:
+        # A non-zero exit code is a failure even when the CLI printed a perfectly
+        # valid JSON envelope: that is exactly how "problems" used to be lost.
+        detail = "; ".join(problems or []) or str(parsed.get("error") or "")
+        error = f"CLI exited {code} with status {status or 'MISSING'}" + (f": {detail[:800]}" if detail else "")
     elif isinstance(parsed, dict) and parsed.get("error"):
         error = str(parsed["error"])
+    elif status not in ("PASS", "WARN"):
+        error = f"CLI reported status {status or 'MISSING'} with exit code {code}"
     result: dict[str, Any] = {
         "ok": error is None,
+        "status": status,
         "exit_code": code,
         "elapsed_s": elapsed,
         "command": ["multisimforge", *args],
         "result": parsed if parsed is not None else text[-8000:],
     }
+    if problems:
+        result["problems"] = problems
     if error:
         result["error"] = error
     if err and err.strip():
@@ -113,22 +130,27 @@ def _make_output_path(p: str, default_name: str) -> Path:
 
 @mcp.tool()
 async def runtime_status() -> dict[str, Any]:
-    """Check adapter config, interpreters, Multisim 14.3 install, and COM registration."""
+    """Check the adapter environment.
+
+    Only the items Multisim really needs are 'required' (they decide ok). Config
+    extras such as node_decoder, samples_dir or master_db are reported as optional:
+    the CLI locates them by itself and most features work without them.
+    """
     cfg = _load_config()
     checks: list[dict[str, Any]] = []
 
-    def add(name: str, ok: bool, detail: str = "") -> None:
-        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+    def add(name: str, ok: bool, detail: str = "", required: bool = True) -> None:
+        checks.append({"name": name, "ok": bool(ok), "required": bool(required), "detail": detail})
 
-    add("config.json", CONFIG_PATH.is_file(), str(CONFIG_PATH))
+    add("config.json", CONFIG_PATH.is_file(), str(CONFIG_PATH), required=False)
     add("cli_python", Path(CLI_PYTHON).is_file(), CLI_PYTHON)
     add("multisim_exe", Path(cfg.get("multisim_exe", "")).is_file(), cfg.get("multisim_exe", ""))
-    add("samples_dir", Path(cfg.get("samples_dir", "")).is_dir(), cfg.get("samples_dir", ""))
-    add("master_db", Path(cfg.get("master_db", "")).is_file(), cfg.get("master_db", ""))
-    add("node_decoder", Path(cfg.get("node_decoder", "")).is_dir(), cfg.get("node_decoder", ""))
+    add("samples_dir", Path(cfg.get("samples_dir", "")).is_dir(), cfg.get("samples_dir", ""), required=False)
+    add("master_db", Path(cfg.get("master_db", "")).is_file(), cfg.get("master_db", ""), required=False)
+    add("node_decoder", Path(cfg.get("node_decoder", "")).is_dir(), cfg.get("node_decoder", ""), required=False)
     add("python32", Path(cfg.get("python32", "")).is_file(), cfg.get("python32", ""))
-    add("library_dir", Path(cfg.get("library_dir", "")).is_dir(), cfg.get("library_dir", ""))
-    add("work_dir", Path(cfg.get("work_dir", "")).is_dir(), cfg.get("work_dir", ""))
+    add("library_dir", Path(cfg.get("library_dir", "")).is_dir(), cfg.get("library_dir", ""), required=False)
+    add("work_dir", Path(cfg.get("work_dir", "")).is_dir(), cfg.get("work_dir", ""), required=False)
 
     probe = (
         "import importlib.util as u,json;"
@@ -142,33 +164,38 @@ async def runtime_status() -> dict[str, Any]:
         deps = {}
         add("capture_deps_error", False, str(exc))
     for name, ok in deps.items():
-        add(f"cli_dep:{name}", ok, "capture/sim dependency")
+        add(f"cli_dep:{name}", ok, "capture/sim dependency", required=(name == "win32com"))
     if cfg.get("python32"):
         try:
             com = subprocess.run(
-                [cfg["python32"], "-c", "import win32com.client, pythoncom;print('ok')"],
+                [*_python32_cmd(cfg["python32"]), "-c", "import win32com.client, pythoncom;print('ok')"],
                 capture_output=True, text=True, timeout=30,
             )
             add("python32_win32com", com.returncode == 0 and "ok" in com.stdout, (com.stderr or "").strip()[-300:])
         except Exception as exc:  # pragma: no cover
             add("python32_win32com", False, str(exc))
 
-    import winreg
+    if sys.platform == "win32":
+        import winreg
 
-    try:
-        key = "WOW6432Node\\CLSID\\{D9CBB7A1-6AD6-438B-AD1B-42FB2DB00CAE}\\InprocServer32"
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key) as h:
-            dll = str(winreg.QueryValue(h, None))
-        add("com_registration", Path(dll).is_file(), dll)
-    except OSError as exc:
-        add("com_registration", False, str(exc))
+        try:
+            key = "WOW6432Node\\CLSID\\{D9CBB7A1-6AD6-438B-AD1B-42FB2DB00CAE}\\InprocServer32"
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key) as h:
+                dll = str(winreg.QueryValue(h, None))
+            add("com_registration", Path(dll).is_file(), dll)
+        except OSError as exc:
+            add("com_registration", False, str(exc))
+    else:
+        add("com_registration", True, "not a Windows host: COM is unavailable by design", required=False)
 
+    required = [item for item in checks if item.get("required", True)]
     return {
         "adapter": str(ADAPTER_DIR),
         "config": cfg,
         "checks": checks,
-        "ok": all(item["ok"] for item in checks),
-        "failing": [item["name"] for item in checks if not item["ok"]],
+        "ok": all(item["ok"] for item in required),
+        "failing": [item["name"] for item in required if not item["ok"]],
+        "optional_failing": [item["name"] for item in checks if not item.get("required", True) and not item["ok"]],
     }
 
 

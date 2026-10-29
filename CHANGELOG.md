@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-10-30
+
+Reliability release. No new user-facing features; the goal is that a failed run
+can no longer look like a successful one.
+
+### Changed
+
+- Every command now returns one envelope: `status` (`PASS` / `WARN` / `FAIL` /
+  `ERROR` / `CANCELLED`) plus the matching `exit_code` (0 / 0 / 2 / 1 / 130).
+  The MCP adapter derives `ok` from the exit code and status, so a design with
+  wiring problems is reported as a failure instead of `ok: true`.
+- Degraded routing is an error by default: when a net has no obstacle-free path,
+  `build` raises `RouteError`, names the failing nets and writes nothing. Pass
+  `--allow-fallback` to accept the old behaviour; the result is then `WARN` with
+  `degraded: true` and the failing nets listed.
+- `check` additionally reports pins that are not attached to any wire and nets
+  with no wire at all. Numeric parsing now rejects trailing garbage
+  (`1kgarbage` is an error, not 1000).
+- `capture` works on a copy under `work/capture/<run_id>/`; the input `.ms14` is
+  byte-identical before and after (both hashes are returned). A netlist-error
+  dialog aborts the run by default (`--on-netlist-error continue` to override).
+- `sim` and `capture` use a per-run working directory, so two concurrent runs of
+  the same file name cannot overwrite each other; `build` writes atomically.
+- `runtime_status` separates required checks from optional ones and no longer
+  imports `winreg` on non-Windows hosts.
+- CI runs the offline suite with `-m "not needs_parts"`; circuit-building tests
+  skip when no part library is present and run on a self-hosted Windows job.
+
+### Fixed
+
+- MCP `check_design` / `build_schematic` could report success with exit code 2.
+- `capture` could rewrite the input design when recalibrating the scope timebase.
+- `"py -3-32"` was passed to `subprocess` as a single executable name.
+- `server.json` no longer advertises a PyPI package that was never published.
+
 ## [0.1.0] - 2026-10-29
 
 First public release.

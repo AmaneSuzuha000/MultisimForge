@@ -5,15 +5,7 @@
     "url": "https://github.com/AmaneSuzuha000/MultisimForge",
     "source": "github"
   },
-  "version": "0.1.0",
-  "packages": [
-    {
-      "registryType": "pypi",
-      "identifier": "multisimforge",
-      "version": "0.1.0",
-      "runtimeHint": "python"
-    }
-  ],
+  "version": "0.1.1",
   "entrypoint": {
     "command": "python",
     "args": [

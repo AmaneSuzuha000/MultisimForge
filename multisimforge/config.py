@@ -86,6 +86,19 @@ def _detect_suite() -> tuple[str, str, str]:
     return str(suite / "multisim.exe"), str(samples), str(db)
 
 
+def python32_argv() -> list[str]:
+    """Command prefix for the 32-bit COM worker.
+
+    The value may be a real executable path (which can contain spaces) or the
+    launcher invocation "py -3-32" -- that one has to become two argv elements,
+    otherwise subprocess looks for a file literally named "py -3-32".
+    """
+    value = str(CONFIG.get("python32") or "")
+    if value.startswith("py ") or value.startswith("py.exe "):
+        return value.split()
+    return [value]
+
+
 def _detect_python32() -> str:
     """Find a 32-bit interpreter with pywin32 installed (Multisim's automation interface is only usable from a 32-bit process)."""
     override = os.environ.get("MULTISIMFORGE_PYTHON32")

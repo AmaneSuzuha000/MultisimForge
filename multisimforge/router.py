@@ -9,6 +9,19 @@ from bisect import bisect_left, bisect_right
 from functools import lru_cache
 
 
+class RouteError(ValueError):
+    """One or more nets have no obstacle-free route (degraded wiring is not acceptable)."""
+
+    def __init__(self, failures):
+        self.failures = list(failures)
+        nets = sorted({f["net"] for f in self.failures})
+        detail = "; ".join(f"{f['net']}: {f['reason']}" for f in self.failures[:6])
+        more = "" if len(self.failures) <= 6 else f" (+{len(self.failures) - 6} more)"
+        super().__init__(
+            f"no obstacle-free route for {len(nets)} net(s): {detail}{more}. "
+            f"Move parts to leave routing channels, or pass --allow-fallback to accept degraded wiring")
+
+
 def rectangle(item):
     x, y = float(item["x"]), float(item["y"])
     return x, y, x + float(item.get("width", 126)), y + float(item.get("height", 108))
@@ -214,7 +227,7 @@ def route_island(conns, obstacles, boxes, occupied_other):
     """
     pin_pt = [(float(c["x"]), float(c["y"])) for c in conns]
     esc = [pin_escape(c, boxes) for c in conns]
-    edges, junctions, fallbacks = [], [], 0
+    edges, junctions, failures = [], [], []
     n = len(conns)
 
     def own_segments(exclude=None):
@@ -223,9 +236,9 @@ def route_island(conns, obstacles, boxes, occupied_other):
     i, j = min(((i, j) for i in range(n) for j in range(i + 1, n)), key=lambda ij: _manhattan(esc[ij[0]], esc[ij[1]]))
     try:
         path = route_pins(conns[i], conns[j], obstacles, occupied_other)
-    except ValueError:
+    except ValueError as exc:
         path = simplify([pin_pt[i], *_elbow(esc[i], esc[j]), pin_pt[j]])
-        fallbacks += 1
+        failures.append(f"pins {i}-{j}: {exc}" or "no obstacle-free path")
     edges.append({"a": ("pin", i), "b": ("pin", j), "path": path})
     done = {i, j}
     while len(done) < n:
@@ -266,7 +279,7 @@ def route_island(conns, obstacles, boxes, occupied_other):
         if best is None:
             _, ei, si, t = options[0]
             tail = _elbow(esc[p], t)
-            fallbacks += 1
+            failures.append(f"pin {p}: no obstacle-free path to the existing wire")
         else:
             _, ei, si, t, tail = best
         new_path = simplify([pin_pt[p], *tail])
@@ -283,14 +296,15 @@ def route_island(conns, obstacles, boxes, occupied_other):
             edges.append({"a": ("j", jk), "b": e["b"], "path": simplify([t] + pts[si + 1:])})
         edges.append({"a": ("pin", p), "b": ("j", jk), "path": new_path})
         done.add(p)
-    return edges, junctions, fallbacks
+    return edges, junctions, failures
 
 
 def route_all(connections, boxes, labels=()):
     """connections: {net: [pin, ...]}, pin = {"x","y","refdes","direction","ground"}; labels are label rectangles the wires route around.
 
     Ground nets are split into islands per ground symbol; each ground pin connects to its nearest symbol;
-    short nets are routed first (less room to detour), long ones later and around them. Returns [(net, pin group, edges, junctions)], fallback count.
+    short nets are routed first (less room to detour), long ones later and around them.
+    Returns ([(net, pin group, edges, junctions)], [{"net", "reason"} for every degraded wire]).
     """
     islands = []
     for name, conns in connections.items():
@@ -318,7 +332,7 @@ def route_all(connections, boxes, labels=()):
         return (max(xs) - min(xs)) + (max(ys) - min(ys))
 
     islands.sort(key=span)
-    result, occupied, fallbacks = [], [], 0
+    result, occupied, failures = [], [], []
     for name, conns in islands:
         mine = {id(c) for c in conns}
         obstacles = list(boxes) + list(labels)
@@ -331,8 +345,8 @@ def route_all(connections, boxes, labels=()):
                 obstacles.append({"refdes": "__pin__", "x": min(px, ex) - 3, "y": min(py, ey) - 3,
                                   "width": abs(px - ex) + 6, "height": abs(py - ey) + 6})
         edges, junctions, fb = route_island(conns, obstacles, boxes, occupied)
-        fallbacks += fb
+        failures += [{"net": name, "reason": reason} for reason in fb]
         for e in edges:
             occupied.extend(_segments(e["path"]))
         result.append((name, conns, edges, junctions))
-    return result, fallbacks
+    return result, failures

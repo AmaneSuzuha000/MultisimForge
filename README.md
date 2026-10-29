@@ -74,13 +74,32 @@ MultisimForge sim out/rc.ms14 --ac 10,100k --out vout --in vin      # cutoff fre
 MultisimForge capture out/rc.ms14 shots                             # real screenshots (do not touch mouse/keyboard)
 ```
 
-Every command prints JSON:
+Every command prints one JSON envelope with a `status` and the matching `exit_code`:
 
 ```json
-{"problems": [], "warnings": [], "crossings": 0, "nets": {"vin": ["R1.1", "V1.1", "XSC1.1"]}}
+{"problems": [], "warnings": [], "crossings": 0, "nets": {"vin": ["R1.1", "V1.1", "XSC1.1"]},
+ "status": "PASS", "exit_code": 0}
 ```
 
+| status | exit code | meaning |
+|---|---|---|
+| `PASS` | 0 | every mandatory check passed |
+| `WARN` | 0 | usable, with a declared caveat (layout advice, degraded routing you allowed) |
+| `FAIL` | 2 | the design is wrong: `problems` says what |
+| `ERROR` | 1 | the tool or the environment failed |
+| `CANCELLED` | 130 | interrupted |
+
 A non-empty `problems` means the drawing disagrees with the netlist and must be fixed; `warnings` are layout advice (too many crossings, detours).
+
+### Routing is strict by default
+
+If a net has no obstacle-free path, `build` fails with `RouteError` and writes
+nothing — it will not quietly draw a wire through a component. Move parts to
+leave a channel, or accept the compromise explicitly:
+
+```powershell
+MultisimForge build examples/rc_lowpass.json --allow-fallback   # status WARN, degraded: true
+```
 
 ## Explicit wiring
 

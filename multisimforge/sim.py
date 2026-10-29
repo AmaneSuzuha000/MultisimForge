@@ -225,7 +225,9 @@ def run(ms14: str, nets: list, op=False, ac=None, tran=None, ac_out=None, ac_in=
     if not nets:
         raise ValueError("Specify at least one net to measure")
     root = xmlio.load(ms14)
-    work = Path(CONFIG["work_dir"]) / "probe"
+    from .result import new_run_id
+    run_id = new_run_id()
+    work = Path(CONFIG["work_dir"]) / "probe" / run_id
     work.mkdir(parents=True, exist_ok=True)
     probe_file = work / Path(ms14).name          # The file name (circuit name) must stay unchanged; probe and instrument records are matched by it
     outputs = add_probes(root, [n for n in nets if n != "0"], lib, str(probe_file))

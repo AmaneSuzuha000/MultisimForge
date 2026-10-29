@@ -56,7 +56,7 @@ def _write_state(state):
 
 def _request(job: dict, timeout: float) -> dict:
     """Send a job to the daemon; start the daemon if it is not running."""
-    from .config import CONFIG, ROOT
+    from .config import CONFIG, ROOT, python32_argv
     state = _read_state()
     if state:
         try:
@@ -64,7 +64,7 @@ def _request(job: dict, timeout: float) -> dict:
         except (OSError, ValueError):
             pass                                        # daemon has exited; restart it
     proc = subprocess.Popen(
-        [CONFIG["python32"], "-X", "utf8", "-m", "multisimforge.com", "--serve"],
+        [*python32_argv(), "-X", "utf8", "-m", "multisimforge.com", "--serve"],
         cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
     )
@@ -146,7 +146,7 @@ def _oneshot(job: dict, timeout: float) -> dict:
     from .config import CONFIG, ROOT
     before = _multisim_pids()
     try:
-        proc = subprocess.run([CONFIG["python32"], "-X", "utf8", "-m", "multisimforge.com"],
+        proc = subprocess.run([*python32_argv(), "-X", "utf8", "-m", "multisimforge.com"],
                               input=json.dumps(job), capture_output=True, text=True, encoding="utf-8",
                               errors="replace", timeout=timeout, cwd=str(ROOT))
     except subprocess.TimeoutExpired:

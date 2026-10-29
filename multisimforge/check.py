@@ -78,6 +78,15 @@ class Circuit:
             out[xmlio.unasc(it[0].get("LocalName")).lower()] = {m for m in members if not m.startswith("0.")}
         return out
 
+    def pin_labels(self) -> set:
+        """Every component pin on the sheet, excluding ground-symbol pins."""
+        out = set()
+        for port_id in self.ports:
+            label = self.port_label(port_id)
+            if not label.startswith("0."):
+                out.add(label)
+        return out
+
     def graphic_groups(self):
         """Group component pins by the graphical connections of wires and junctions: [{component.pin, ...}, ...]."""
         parent = {}
@@ -123,10 +132,19 @@ def check_file(path, expected: dict | None = None) -> dict:
         owners = {port_net.get(m) for m in members}
         if len(owners) > 1:
             problems.append(f"Wires connect different nets together: {sorted(members)} belong to {sorted(o or '?' for o in owners)}")
+    connected = set().union(*groups) if groups else set()
     for net, members in nets.items():
+        if net == "0" or len(members) < 2:
+            continue                              # a one-pin net is an unused pin, not a broken net
         parts_ = [g for g in groups if g & members]
-        if net != "0" and len(parts_) > 1:
+        if not parts_:
+            problems.append(f"Net {net} has no wire at all on the diagram (pins {sorted(members)} are not connected to anything)")
+            continue
+        if len(parts_) > 1:
             problems.append(f"Net {net} is split into {len(parts_)} pieces on the diagram: {[sorted(g) for g in parts_]}")
+        loose = sorted(members - connected)
+        if loose:
+            problems.append(f"Pins {loose} of net {net} are not attached to any wire")
     if expected:
         for net, want in expected.items():
             have = nets.get(net.lower(), set())
@@ -179,7 +197,7 @@ def check_file(path, expected: dict | None = None) -> dict:
         warnings.append(f"Wire of net {net} passes through {name}")
     if crossings:
         warnings.append(f"Wires of different nets cross in {crossings} places")
-    return {"ok": not problems, "problems": problems, "warnings": warnings, "crossings": crossings,
+    return {"problems": problems, "warnings": warnings, "crossings": crossings,
             "nets": {k: sorted(v) for k, v in nets.items()}}
 
 

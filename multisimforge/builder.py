@@ -14,6 +14,7 @@ spec fields:
     sheet        sheet size [width, height] in inches; defaults to a tight fit around the circuit
 """
 import math
+import os
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -21,7 +22,8 @@ from pathlib import Path
 from . import netlist as nl
 from . import xmlio
 from .parts import Library
-from .router import route_all
+from .result import new_run_id
+from .router import RouteError, route_all
 
 # Multisim colours are 0x00BBGGRR
 COLORS = {"red": 255, "blue": 16711680, "green": 32768, "magenta": 16711935, "orange": 33023, "black": 0}
@@ -382,6 +384,8 @@ class Builder:
         self.model_seq = {}
         self.instrument_states, self.refdes_items = [], []
         self.expected = {}                           # {net: {refdes.pin}}, compared against the file during self-check
+        self.route_failures = []                     # nets whose wire could only be drawn by degrading
+        self.degraded = False
 
     # -- nets ---------------------------------------------------------------
     def node(self, net: str):
@@ -663,7 +667,7 @@ class Builder:
             net_wire_items.setdefault(net, []).append(wire_item)
             self.wires.setdefault(net, []).append(chain)
 
-    def wire_all(self, colors: dict, net_names: bool, explicit=None, wire_width=1):
+    def wire_all(self, colors: dict, net_names: bool, explicit=None, wire_width=1, allow_fallback=False):
         for net, conns in self.connections.items():
             if len(conns) < 2:
                 continue
@@ -685,9 +689,16 @@ class Builder:
                         clist.append(ET.Element("Item", {"ID": c["extpin"], "Class": "CODPinComp"}))
         explicit = explicit or {}
         routed = {n: c for n, c in self.connections.items() if len(c) >= 2 and n not in explicit}
-        islands, fallbacks = route_all(routed, self.boxes, self.labels)
-        if fallbacks:
-            self.warnings.append(f"{fallbacks} wire segments had no obstacle-free path and fell back to a simple polyline; check the preview and adjust the layout")
+        islands, failures = route_all(routed, self.boxes, self.labels)
+        self.route_failures = failures
+        if failures:
+            if not allow_fallback:
+                raise RouteError(failures)        # nothing is written: a degraded drawing is not a result
+            self.degraded = True
+            nets = sorted({f["net"] for f in failures})
+            self.warnings.append(
+                f"degraded routing: {len(failures)} wire segment(s) on net(s) {', '.join(nets)} had no "
+                f"obstacle-free path and fell back to a simple polyline; the drawing may cross parts or other nets")
         self.wires = {}
         net_wire_items = {}
         for net, conns, edges, junctions in islands:
@@ -844,8 +855,15 @@ def _layout_key(layout: dict, refdes: str):
     return None
 
 
-def build(spec: dict, lib: Library | None = None) -> dict:
+def build(spec: dict, lib: Library | None = None, allow_fallback: bool = False) -> dict:
+    """Build a .ms14 from a spec.
+
+    Degraded routing (a wire with no obstacle-free path) is an error by default:
+    raise RouteError and write nothing. Pass allow_fallback=True to accept it;
+    the result then carries degraded=True and the failing nets.
+    """
     lib = lib or Library()
+    run_id = new_run_id()
     out = Path(spec["output"]).resolve()
     if not re.fullmatch(r"[A-Za-z0-9_\-]+", out.stem) or out.suffix.lower() != ".ms14":
         raise ValueError("output must be .ms14 with a file name of letters, digits, underscore and hyphen only")
@@ -902,7 +920,8 @@ def build(spec: dict, lib: Library | None = None) -> dict:
             colors[inst.nets[1]] = COLORS["blue"]
     for net, color in (spec.get("colors") or {}).items():
         colors[nl.net_name(net)] = COLORS.get(str(color).lower(), color)
-    b.wire_all(colors, bool(spec.get("net_names")), spec.get("wires") or {}, int(spec.get("wire_width", 1)))
+    b.wire_all(colors, bool(spec.get("net_names")), spec.get("wires") or {}, int(spec.get("wire_width", 1)),
+               allow_fallback=allow_fallback)
 
     instruments = spec.get("instruments") or {}
     sim_time = number(spec["sim_time"]) if spec.get("sim_time") else None
@@ -913,9 +932,17 @@ def build(spec: dict, lib: Library | None = None) -> dict:
         sim_time = sim_time or 20 * sweep
     b.finish(instruments, params_of, sim_time, spec.get("sheet"))
     out.parent.mkdir(parents=True, exist_ok=True)
-    xmlio.save(b.root, out)
-    return {"ms14": str(out), "sim_time": sim_time, "sweep": sweep, "placements": b.placements,
-            "wires": b.wires, "boxes": b.boxes, "warnings": b.warnings, "expected": b.expected}
+    tmp = out.with_name(f".{out.name}.tmp-{run_id}")
+    try:
+        xmlio.save(b.root, tmp)
+        os.replace(tmp, out)          # atomic: a failed build never leaves a half-written .ms14
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return {"ms14": str(out), "run_id": run_id, "sim_time": sim_time, "sweep": sweep,
+            "placements": b.placements, "wires": b.wires, "boxes": b.boxes,
+            "warnings": b.warnings, "expected": b.expected,
+            "degraded": b.degraded, "route_failures": b.route_failures}
 
 
 def set_sim_time(ms14, sim_time: float):

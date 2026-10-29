@@ -12,15 +12,19 @@ from multisimforge import builder, check, xmlio
 ROOT = Path(__file__).resolve().parent.parent
 OUT = Path(__file__).resolve().parent / "_out"
 
+pytestmark = pytest.mark.needs_parts
 
-def _build(name):
+
+def _build(name, **kwargs):
     spec = json.loads((ROOT / "examples" / name).read_text(encoding="utf-8"))
     spec["output"] = str(OUT / Path(spec["output"]).with_suffix(".ms14").name)
-    return builder.build(spec)
+    return builder.build(spec, **kwargs)
 
 
 def test_rc_lowpass():
     result = _build("rc_lowpass.json")
+    assert result["degraded"] is False
+    assert result["route_failures"] == []
     assert result["warnings"] == [], result["warnings"]
     report = check.check_file(result["ms14"])
     assert report["problems"] == [], report["problems"]
@@ -80,3 +84,26 @@ def test_mirror_validation():
     spec["layout"]["XFG3"] = [45, 90, "diagonal"]
     with pytest.raises(ValueError):
         builder.build(spec)
+
+def test_degraded_routing_is_rejected():
+    """A layout with no routing channel must fail instead of drawing wires through parts."""
+    from multisimforge.router import RouteError
+    spec = json.loads((ROOT / "examples" / "rc_lowpass.json").read_text(encoding="utf-8"))
+    spec["output"] = str(OUT / "crowded.ms14")
+    spec["layout"] = {"V1": [108, 216], "R1": [252, 180], "C1": [252, 196, 90], "XSC1": [300, 130],
+                      "GND": [[108, 306], [252, 342], [300, 198]]}
+    with pytest.raises(RouteError) as exc:
+        builder.build(spec)
+    assert exc.value.failures, "RouteError must name the failing nets"
+    assert not (OUT / "crowded.ms14").exists(), "a rejected build must not leave a file behind"
+
+
+def test_degraded_routing_can_be_allowed():
+    spec = json.loads((ROOT / "examples" / "rc_lowpass.json").read_text(encoding="utf-8"))
+    spec["output"] = str(OUT / "crowded_ok.ms14")
+    spec["layout"] = {"V1": [108, 216], "R1": [252, 180], "C1": [252, 196, 90], "XSC1": [300, 130],
+                      "GND": [[108, 306], [252, 342], [300, 198]]}
+    result = builder.build(spec, allow_fallback=True)
+    assert result["degraded"] is True
+    assert result["route_failures"]
+    assert any("degraded routing" in w for w in result["warnings"])
