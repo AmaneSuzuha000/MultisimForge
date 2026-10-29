@@ -1,0 +1,46 @@
+{
+  "netlist": "V1 vin 0 DC 0 AC 1 SIN(0 1 1k)\nR1 vin vout 1k\nC1 vout 0 0.1u\nXSC1 vin vout 0 nc1 0 nc2 OSCILLOSCOPE\n",
+  "output": "out/rc.ms14",
+  "layout": {
+    "V1": [
+      108,
+      216
+    ],
+    "R1": [
+      252,
+      180
+    ],
+    "C1": [
+      396,
+      252,
+      90
+    ],
+    "XSC1": [
+      540,
+      126
+    ],
+    "GND": [
+      [
+        108,
+        306
+      ],
+      [
+        396,
+        342
+      ],
+      [
+        612,
+        198
+      ]
+    ]
+  },
+  "instruments": {
+    "XSC1": {
+      "timebase": "500us",
+      "a_scale": "1V",
+      "b_scale": "1V",
+      "trigger": "none"
+    }
+  },
+  "sim_time": "5ms"
+}

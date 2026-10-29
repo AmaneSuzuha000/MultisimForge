@@ -1,0 +1,83 @@
+{
+  "netlist": "XFG3 out nc1 0 FGEN WAVE=SINE FREQ=1000 AMPLITUDE=5 OFFSET=0\nXSC3 out nc2 0 nc3 nc4 nc5 OSCILLOSCOPE\n",
+  "output": "out/explicit_wiring.ms14",
+  "layout": {
+    "XFG3": [
+      45,
+      90,
+      "mirror-x"
+    ],
+    "XSC3": [
+      183,
+      108
+    ],
+    "GND": [
+      [
+        147,
+        171
+      ]
+    ]
+  },
+  "instruments": {
+    "XSC3": {
+      "timebase": "500us",
+      "a_scale": "2V",
+      "b_scale": "2V",
+      "trigger": "none"
+    }
+  },
+  "sim_time": "5ms",
+  "colors": {
+    "0": "red",
+    "out": "red"
+  },
+  "wires": {
+    "0": [
+      [
+        [
+          27,
+          90
+        ],
+        [
+          27,
+          171
+        ],
+        [
+          144,
+          171
+        ]
+      ],
+      [
+        [
+          144,
+          126
+        ],
+        [
+          144,
+          171
+        ]
+      ]
+    ],
+    "out": [
+      [
+        [
+          63,
+          90
+        ],
+        [
+          63,
+          144
+        ],
+        [
+          135,
+          144
+        ],
+        [
+          135,
+          126
+        ]
+      ]
+    ]
+  },
+  "wire_width": 2
+}

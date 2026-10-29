@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+# local path overrides, never committed
+config.json
+# generated output and the machine-local part library
+work/
+out/
+tests/_out/
+parts/
+*.ms14
+work_*

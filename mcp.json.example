@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "multisimforge": {
+      "command": "python",
+      "args": [
+        "E:/path/to/multisimforge/mcp_adapter/server.py"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}

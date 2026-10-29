@@ -1,0 +1,46 @@
+{
+  "netlist": "XFG1 vin 0 0 FGEN WAVE=SINE FREQ=100 AMPLITUDE=5 OFFSET=0\nC1 vin vout 2u\nR4 vout 0 500\nXSC1 vin vout 0 0 0 0 OSCILLOSCOPE\n",
+  "output": "out/phase_lead.ms14",
+  "layout": {
+    "XFG1": [
+      90,
+      180
+    ],
+    "C1": [
+      420,
+      200
+    ],
+    "R4": [
+      420,
+      320,
+      90
+    ],
+    "XSC1": [
+      640,
+      90
+    ],
+    "GND": [
+      [
+        90,
+        300
+      ],
+      [
+        420,
+        430
+      ],
+      [
+        640,
+        210
+      ]
+    ]
+  },
+  "instruments": {
+    "XSC1": {
+      "timebase": "2ms",
+      "a_scale": "2V",
+      "b_scale": "2V",
+      "trigger": "none"
+    }
+  },
+  "sim_time": "20ms"
+}

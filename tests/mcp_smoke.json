@@ -1,0 +1,5 @@
+[
+  {"tool": "runtime_status", "arguments": {}},
+  {"tool": "check_design", "arguments": {"ms14": "out/replica_siggen_scope.ms14"}},
+  {"tool": "build_schematic", "arguments": {"spec": {"netlist": "XFG3 out nc1 0 FGEN WAVE=SINE FREQ=1000 AMPLITUDE=5\nXSC3 out nc2 0 nc3 nc4 nc5 OSCILLOSCOPE\n", "output": "out/mcp_smoke.ms14", "layout": {"XFG3": [45, 90, "mirror-x"], "XSC3": [183, 108], "GND": [[147, 171]]}, "instruments": {"XSC3": {"timebase": "500us", "a_scale": "2V", "b_scale": "2V", "trigger": "none"}}, "sim_time": "5ms", "colors": {"out": "red", "0": "red"}, "wire_width": 2, "wires": {"out": [[[63,90],[63,144],[135,144],[135,126]]], "0": [[[27,90],[27,171],[144,171]], [[144,126],[144,171]]]}}}}
+]

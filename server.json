@@ -1,0 +1,23 @@
+{
+  "name": "io.github.AmaneSuzuha000/multisimforge",
+  "description": "Generate, self-check, simulate and screenshot NI Multisim 14 circuits from a JSON spec.",
+  "repository": {
+    "url": "https://github.com/AmaneSuzuha000/MultisimForge",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "multisimforge",
+      "version": "0.1.0",
+      "runtimeHint": "python"
+    }
+  ],
+  "entrypoint": {
+    "command": "python",
+    "args": [
+      "mcp_adapter/server.py"
+    ]
+  }
+}
