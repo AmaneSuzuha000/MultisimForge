@@ -5,7 +5,7 @@
     "url": "https://github.com/AmaneSuzuha000/MultisimForge",
     "source": "github"
   },
-  "version": "0.1.5",
+  "version": "0.1.6",
   "entrypoint": {
     "command": "python",
     "args": [

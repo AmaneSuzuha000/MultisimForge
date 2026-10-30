@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-10-31
+
+Tests for the two modules that touch the operating system: the screenshot helpers and
+the COM fallback. Both run offline, because the process boundary is the only part that
+needs the real world and that is the part replaced.
+
+### Fixed
+
+- **A machine-local coverage database was committed to the repository.** `.coverage` is
+  rewritten by every test run, so it dirtied the working tree for anyone who ran the
+  suite. It is untracked and ignored now.
+
+### Added
+
+- Screenshot helpers tested on synthetic images with known answers: how much of a scope
+  display a trace covers, where the page is inside a screenshot, how far to crop. Real
+  captures from this machine are used as a second opinion (a full sweep scores 1.00, a
+  partial one 0.67).
+- The COM fallback tested by replacing the subprocess: a timeout is reported as a
+  timeout, a worker error passes through, a job that timed out is never replayed, and a
+  Multisim process started by a crashed worker is killed while a pre-existing one is
+  left alone.
+- The part library tested as a directory of files: index round-trip, case-insensitive
+  lookup, the close-match list in a failed lookup, SPICE pin ordering, and every one of
+  the parts harvested on this machine describing without raising.
+- CLI argument validation and the file-only commands: `--debug`, `_positive`, `_floats`,
+  a non-object or non-UTF-8 spec, and an `encode`/`decode` round trip.
+
+Coverage of the offline-testable code: 60% to 65%, `capture.py` 0% to 31%, `com.py`
+24% to 30%, `parts.py` 21% to 38%, `cli.py` 45% to 56%. Test count 142 to 203.
 ## [0.1.5] - 2026-10-31
 
 A coverage-driven pass over the parts of the code that had no test at all. Four defects
