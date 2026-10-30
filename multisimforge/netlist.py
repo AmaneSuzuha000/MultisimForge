@@ -151,7 +151,12 @@ def parse(text: str) -> list[Instance]:
             inst.part = part
             inst.nets = [net_name(t) for t in tokens[1:idx]]
             for t in tokens[idx + 1:]:
-                k, _, v = t.partition("=")
+                k, sep, v = t.partition("=")
+                if not sep:
+                    # "XSC1 a 0 b 0 OSCILLOSCOPE extra" used to be accepted, with the stray word
+                    # silently turned into an empty-valued parameter called EXTRA.
+                    raise ValueError(f"{ref}: {t!r} is not a key=value instrument setting "
+                                     f"(write {ref} node... {sorted(keywords)[0]} KEY=VALUE ...)")
                 inst.params[k.upper()] = v
         elif key[0] in "RCL" and not key.startswith("LED"):
             if len(tokens) < 4:
@@ -169,8 +174,11 @@ def parse(text: str) -> list[Instance]:
             if key[0] == "V":
                 inst.part = {"dc": "DC_POWER", "sin": "AC_VOLTAGE", "pulse": "PULSE_VOLTAGE"}[kind]
             else:
-                if kind != "dc":
-                    raise ValueError(f"{ref}: only DC current sources are supported")
+                if kind != "dc" or (inst.source.get("ac") and not inst.source.get("dc")):
+                    # "I1 a 0 AC 1" sets the AC amplitude and leaves the DC bias at 0; accepting it
+                    # as a DC source quietly simulated a 0 A bias that the author never wrote.
+                    raise ValueError(f"{ref}: only DC current sources are supported; "
+                                     f"write {ref} node1 node2 <amps> (or use a voltage source for AC)")
                 inst.part = "DC_CURRENT"
         elif key[0] in "DQJM":
             n = NODE_COUNT[key[0]]

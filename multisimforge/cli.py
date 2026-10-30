@@ -211,6 +211,8 @@ def main(argv=None):
         stream.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(prog="multisimforge", add_help=True,
                                 description="Control NI Multisim 14 in text: generate circuits, preview, run simulations and read data, take real screenshots")
+    p.add_argument("--debug", action="store_true",
+                   help="let an unexpected exception raise instead of reporting it as ERROR")
     sub = p.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("parts", help="Part library: init to create / list to search / show details / harvest to collect / fetch from database")
@@ -295,7 +297,7 @@ def main(argv=None):
         _out({"error": f"{type(exc).__name__}: {exc}"}, Status.ERROR)
         sys.exit(exit_code_for(Status.ERROR))
     except Exception as exc:                      # never let a traceback replace the envelope
-        if "--debug" in (argv if argv is not None else sys.argv[1:]):
+        if a.debug:
             raise
         _out({"error": f"{type(exc).__name__}: {exc}", "detail": "run with --debug for a traceback"}, Status.ERROR)
         sys.exit(exit_code_for(Status.ERROR))

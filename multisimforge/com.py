@@ -47,11 +47,19 @@ def _multisim_pids() -> set:
 
 
 def _read_state():
+    """The daemon state file, or None. Never raises: every COM call starts here.
+
+    A half-written or hand-edited file is normal, not exceptional: "null", a list, or
+    a JSON object without a port all mean "no usable daemon", and an AttributeError
+    from calling .get() on a list would escape every caller's except clause.
+    """
     try:
         state = json.loads(_state_path().read_text(encoding="utf-8"))
-        return state if state.get("port") else None
     except (OSError, ValueError):
         return None
+    if not isinstance(state, dict):
+        return None
+    return state if state.get("port") else None
 
 
 def _write_state(state):

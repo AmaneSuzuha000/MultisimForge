@@ -185,6 +185,10 @@ def _unwrap(phases):
 
 def ac_summary(freq, h, at=()):
     """Magnitude/phase highlights: peak (resonant frequency), -3 dB frequencies with their phases, and gain/phase at the specified frequencies."""
+    if len(freq) == 0 or len(h) == 0:
+        raise ValueError("the AC sweep produced no points; check the sweep range and that the simulation ran")
+    if len(freq) != len(h):
+        raise ValueError(f"the AC sweep returned {len(freq)} frequencies but {len(h)} values")
     mag = [abs(v) for v in h]
     phase = _unwrap([math.degrees(cmath.phase(v)) for v in h])
     k = max(range(len(mag)), key=mag.__getitem__)
@@ -205,6 +209,10 @@ def ac_summary(freq, h, at=()):
 
 
 def tran_summary(t, v):
+    if len(v) == 0 or len(t) == 0:
+        raise ValueError("the transient analysis produced no samples; check the duration and that the simulation ran")
+    if len(t) != len(v):
+        raise ValueError(f"the transient analysis returned {len(t)} timestamps but {len(v)} values")
     n = len(v)
     mean = sum(v) / n
     rms = math.sqrt(sum(x * x for x in v) / n)

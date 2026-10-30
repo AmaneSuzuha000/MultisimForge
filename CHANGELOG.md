@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-10-31
+
+A coverage-driven pass over the parts of the code that had no test at all. Four defects
+came out of it; the rest of the work is tests that pin down behaviour which was only ever
+verified by hand.
+
+### Fixed
+
+- **`--debug` did not exist.** The flag was read from `sys.argv` inside the exception
+  handler but never declared, so `multisimforge check x.ms14 --debug` died in argparse with
+  "unrecognized arguments" instead of showing a traceback. It is a real global option now.
+- **A non-object daemon state file crashed every COM call.** `_read_state` did
+  `json.loads(...).get("port")`, so a file containing `null` or a list raised
+  `AttributeError`, which is in no caller's `except` clause. It returns None instead.
+- **An AC-only current source was silently simulated as 0 A.** `I1 a 0 AC 1` parsed as
+  `DC_CURRENT` with `dc = 0.0`, so the bias current the author wrote never reached the
+  simulator. It is now rejected, with the accepted form named in the message.
+- **A stray word after an instrument keyword became an empty parameter.**
+  `XSC1 a 0 b 0 OSCILLOSCOPE extra` stored `{"EXTRA": ""}` and built a scope with an option
+  that does not exist. Instrument settings must now be `KEY=VALUE`.
+- **An empty AC sweep or transient run raised an arithmetic error.** `ac_summary` and
+  `tran_summary` indexed into an empty result, so the envelope read "max() iterable argument
+  is empty" or "division by zero" instead of saying the simulation produced nothing.
+
+### Added
+
+Tests for what had none: `inspect`, netlist rejection messages, probe placement, the
+structural template harvester, configuration resolution, the CLI envelope and exit codes,
+and daemon state handling. Coverage of the offline-testable code went from 49% to 60%,
+with `netlist.py` at 97%, `xmlio.py` at 98% and `structural.py` at 94%.
 ## [0.1.4] - 2026-10-30
 
 Follow-up to 0.1.3, which introduced a regression and left the auto-repair search unable

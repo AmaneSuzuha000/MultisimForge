@@ -1,6 +1,6 @@
 [project]
 name = "MultisimForge"
-version = "0.1.4"
+version = "0.1.5"
 description = "MultisimForge: generate, verify, simulate and screenshot NI Multisim 14 circuits from plain text"
 readme = "README.md"
 requires-python = ">=3.10"
