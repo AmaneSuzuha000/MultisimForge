@@ -19,10 +19,16 @@ import sys
 import time
 
 PROG_ID = "MultisimInterface.MultisimApp"
+CONNECT_TIMEOUT = 10.0          # liveness probe only; the job itself gets the caller's timeout
+Popen = subprocess.Popen        # one seam for tests; patching subprocess.Popen would leak globally
 
 
 class ComError(RuntimeError):
     pass
+
+
+class JobTimeout(ComError):
+    """The daemon accepted the job but did not answer in time; the work may still be running."""
 
 
 # ---------------------------------------------------------------------------
@@ -55,15 +61,22 @@ def _write_state(state):
 
 
 def _request(job: dict, timeout: float) -> dict:
-    """Send a job to the daemon; start the daemon if it is not running."""
-    from .config import CONFIG, ROOT, python32_argv
+    """Send a job to the daemon; start the daemon if it is not running.
+
+    Connecting and running the job are separate timeouts. A live daemon is given the
+    whole job timeout, because a long analysis is not a dead daemon: timing out early
+    and replaying the job would run the same simulation twice.
+    """
+    from .config import ROOT, python32_argv
     state = _read_state()
     if state:
         try:
-            return _roundtrip(state, job, min(timeout, 10))
-        except (OSError, ValueError):
-            pass                                        # daemon has exited; restart it
-    proc = subprocess.Popen(
+            return _roundtrip(state, job, timeout)
+        except JobTimeout:
+            raise                                   # accepted but slow: never replay it
+        except (OSError, ValueError, ComError):
+            pass                                    # daemon has exited; restart it
+    proc = Popen(                                    # module-level alias: patchable without touching subprocess
         [*python32_argv(), "-X", "utf8", "-m", "multisimforge.com", "--serve"],
         cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
@@ -85,17 +98,27 @@ def _request(job: dict, timeout: float) -> dict:
 
 def _roundtrip(state: dict, job: dict, timeout: float) -> dict:
     payload = dict(job, token=state.get("token"))
-    with socket.create_connection(("127.0.0.1", int(state["port"])), timeout=timeout) as sock:
-        sock.settimeout(max(5.0, timeout))
-        sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-        chunks = []
-        while True:
-            block = sock.recv(65536)
-            if not block:
-                break
-            chunks.append(block)
-            if block.endswith(b"\n"):
-                break
+    sent = False
+    try:
+        # Only the TCP connect gets the short probe timeout; once connected, the job
+        # itself may legitimately run for the caller's full timeout.
+        with socket.create_connection(("127.0.0.1", int(state["port"])),
+                                      timeout=min(timeout, CONNECT_TIMEOUT)) as sock:
+            sock.settimeout(timeout)                    # honour the caller's budget exactly
+            sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            sent = True
+            chunks = []
+            while True:
+                block = sock.recv(65536)
+                if not block:
+                    break
+                chunks.append(block)
+                if block.endswith(b"\n"):
+                    break
+    except socket.timeout as exc:
+        if sent:
+            raise JobTimeout(str(exc)) from None
+        raise
     text = b"".join(chunks).decode("utf-8", "replace").strip()
     if not text:
         raise ValueError("daemon returned no result")
@@ -106,9 +129,17 @@ def _roundtrip(state: dict, job: dict, timeout: float) -> dict:
 
 
 def call(job: dict, timeout: float = 300) -> dict:
-    """Run one COM job. Reuses the background daemon when possible and falls back to a one-shot subprocess on failure."""
+    """Run one COM job. Reuses the background daemon when possible and falls back to a one-shot subprocess on failure.
+
+    Only a failure to reach the daemon falls back; once the daemon has accepted the job,
+    a timeout is reported as an error instead of being replayed, so a slow simulation is
+    never executed twice.
+    """
     try:
         return _request(job, timeout)
+    except JobTimeout as exc:
+        raise ComError(f"Multisim COM job {job.get('op')} timed out after {timeout:g}s; it may still be running, "
+                       f"so it was not retried ({exc})") from None
     except (ComError, OSError, ValueError):
         return _oneshot(job, timeout)
 
@@ -143,7 +174,7 @@ def status() -> dict:
 # Compatibility fallback: one process per task
 # ---------------------------------------------------------------------------
 def _oneshot(job: dict, timeout: float) -> dict:
-    from .config import CONFIG, ROOT
+    from .config import ROOT, python32_argv
     before = _multisim_pids()
     try:
         proc = subprocess.run([*python32_argv(), "-X", "utf8", "-m", "multisimforge.com"],

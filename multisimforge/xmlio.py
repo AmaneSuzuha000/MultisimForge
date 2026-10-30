@@ -63,11 +63,18 @@ def write(path, text: str) -> None:
 
 
 def load(path) -> ET.Element:
-    """Read a .ms14 or a decoded .xml and return the root element."""
+    """Read a .ms14 or a decoded .xml and return the root element.
+
+    A file that is not a circuit raises ValueError with the reason, so callers can
+    report it instead of letting an XML parser traceback reach the user.
+    """
     data = Path(path).read_bytes()
     if data.startswith(codec.MAGIC):
         data = codec.decode(data)
-    return parse_text(data.decode("utf-8", errors="replace"))
+    try:
+        return parse_text(data.decode("utf-8", errors="replace"))
+    except ET.ParseError as exc:
+        raise ValueError(f"{path} is not a Multisim design (invalid XML: {exc})") from None
 
 
 def save(root: ET.Element, path) -> None:

@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-10-30
+
+Correctness release, driven by a line-by-line re-audit of 0.1.2. Every entry below
+was reproduced against the 0.1.2 source before it was fixed.
+
+### Fixed
+
+- **A value with trailing garbage was silently accepted.** `parse_value` matched a
+  number anywhere in the string, so `1k5junk` became `1.5k`; 0.1.1's changelog
+  claimed this was fixed, and it was not. Parsing now anchors at both ends and
+  validates the unit suffix. RKM notation (`1k2`, `4u7`) is supported, and
+  `1mil` is rejected rather than guessed at.
+- **A repaired build could describe a file that no longer existed.** Each repair
+  candidate was written to the same path, so a later candidate overwrote the file
+  the returned result pointed at, and `sha256` matched neither. Each candidate now
+  builds into its own staging file; only the winner is moved into place, and the
+  result carries the SHA-256 of the file that is actually on disk.
+- **A slow COM job could be executed twice.** The client gave every request a
+  10-second ceiling and replayed it in a one-shot process on timeout, so an
+  analysis that legitimately ran longer than 10 s ran again. Connecting is now
+  probed with its own short timeout, the job itself gets the caller's timeout, and
+  a job that timed out after being accepted is reported as an error instead of
+  being retried.
+- **A simulation with no data reported success.** `sim` and `spice` returned
+  `PASS` unconditionally, even when a requested analysis produced nothing. Missing
+  output is now a failure, an absent result file is a failure, and unconsumed
+  warnings downgrade to `WARN` only.
+- **`capture` could photograph a different file with the same name.** The window
+  was chosen by title, which carries only the file stem; a user file called
+  `rc.ms14` could be captured instead of the working copy. The window is now
+  matched through the automation interface's own open path, the run refuses when
+  no window shows the requested file, and a failed run always closes the window it
+  opened.
+- **`check` had blind spots.** It did not notice two components sharing a reference
+  designator, a wire attached to nothing, or two nets drawn on top of each other
+  (a short circuit, which the crossing rule deliberately ignored). All three are
+  reported now.
+- **A corrupt `.ms14` crashed with `struct.error`.** Decoding trusted the length
+  fields a file declares about itself; a truncated or hostile file could ask for an
+  unbounded allocation. Header, section, and total lengths are validated and
+  capped, and reading a non-circuit file raises a described `ValueError`.
+- **Unexpected exceptions broke the one-envelope rule.** `check notes.txt` printed
+  a Python traceback instead of a JSON envelope. Unrecognised errors are now
+  reported as `ERROR` (pass `--debug` to see the traceback).
+- **The MCP adapter diagnosed a different configuration than the CLI used.** It
+  read `config.json` directly, ignoring auto-detection and environment overrides.
+  It now asks the CLI for its resolved configuration, and the `run_cli` escape
+  hatch refuses the two subcommands that can destroy state (`com`, `parts`).
+- **Bad arguments were accepted.** `--wait` / `--timeout` reject non-positive and
+  absurd durations, a spec that is not one UTF-8 JSON object is rejected, and
+  unknown spec fields are named instead of silently ignored.
+
 ## [0.1.2] - 2026-10-30
 
 Routing release. A wire with no clean path is now a last resort, not the first
@@ -44,8 +96,7 @@ can no longer look like a successful one.
   `--allow-fallback` to accept the old behaviour; the result is then `WARN` with
   `degraded: true` and the failing nets listed.
 - `check` additionally reports pins that are not attached to any wire and nets
-  with no wire at all. Numeric parsing now rejects trailing garbage
-  (`1kgarbage` is an error, not 1000).
+  with no wire at all.
 - `capture` works on a copy under `work/capture/<run_id>/`; the input `.ms14` is
   byte-identical before and after (both hashes are returned). A netlist-error
   dialog aborts the run by default (`--on-netlist-error continue` to override).

@@ -74,6 +74,11 @@ MultisimForge sim out/rc.ms14 --ac 10,100k --out vout --in vin      # cutoff fre
 MultisimForge capture out/rc.ms14 shots                             # real screenshots (do not touch mouse/keyboard)
 ```
 
+`capture` works on a copy under `work/capture/<run_id>/` and opens its own window,
+so the input `.ms14` is byte-identical before and after. A window title carries only
+the file stem, so close any other window showing the same file name first: capture
+refuses to guess which file such a window holds.
+
 Every command prints one JSON envelope with a `status` and the matching `exit_code`:
 
 ```json
@@ -145,10 +150,32 @@ Every segment must be horizontal or vertical, and polyline endpoints must land o
 | `inspect x.ms14` | report parts, nets, instrument settings |
 | `sim x.ms14 --nets a,b --op / --ac ... / --tran ...` | real simulation data |
 | `spice x.cir --cmd "tran 1u 10m"` | hand SPICE text to Multisim's engine |
-| `capture x.ms14 outdir` | real screenshots: circuit, each instrument panel, full screen |
+| `capture x.ms14 outdir` | real screenshots: circuit, each instrument panel, full screen (needs no other window open for that file name) |
 | `set-sim-time x.ms14 20ms` | change the interactive simulation stop time |
 | `com status / stop` | inspect or release the background COM worker |
 | `decode / encode` | `.ms14` ↔ XML (debugging) |
+
+### Flags
+
+| Command | Flag | Meaning |
+|---|---|---|
+| `build` | `--preview <png>` | export a preview image after building |
+| | `--allow-fallback` | accept degraded wiring: status `WARN`, `degraded: true` |
+| | `--no-auto-repair` | fail on the spec exactly as written; do not move parts |
+| `check` | — | reads a `.ms14` or a decoded `.xml`; no flags |
+| `sim` | `--nets a,b` | nets to probe (required for meaningful data) |
+| | `--op` / `--ac start,stop,points` / `--tran step,stop` | analyses to run (any combination) |
+| | `--out` / `--in` | AC output node / AC input source |
+| | `--at t1,t2,...` | time points to sample from a transient run |
+| | `--csv <dir>` | also write each analysis to CSV |
+| `spice` | `--cmd "tran 1u 10m"` | SPICE command handed to Multisim's engine |
+| `capture` | `--wait <s>` | how long the display must be still to call it finished (default 1.5) |
+| | `--timeout <s>` | maximum wait (default 90) |
+| | `--keep-open` | leave the window open after capture |
+| | `--on-netlist-error continue` | continue past the netlist-error dialog (default: abort) |
+| any | `--debug` | show the traceback instead of a JSON envelope on an unexpected error |
+
+Durations must be greater than 0 and at most 3600 seconds.
 
 ## MCP server
 

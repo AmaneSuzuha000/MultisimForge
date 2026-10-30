@@ -30,7 +30,7 @@ for sub in ("specs", "captures", "tmp"):
 mcp = MCPServer(
     "multisimforge",
     title="MultisimForge",
-    version="0.1.2",
+    version="0.1.3",
     instructions=(
         "MultisimForge adapter for NI Multisim 14.3. Use check_design for offline "
         "connectivity/layout verification, inspect_design to read an existing .ms14, "
@@ -47,6 +47,24 @@ def _python32_cmd(value: str) -> list[str]:
 
 
 def _load_config() -> dict[str, Any]:
+    """The same resolved configuration the CLI uses.
+
+    The CLI merges config.json with auto-detection and environment variables; asking it
+    for its own view keeps one source of truth, so the adapter cannot report a healthy
+    install as broken (or the other way round).
+    """
+    try:
+        proc = subprocess.run(
+            [CLI_PYTHON, "-c",
+             "import json;from multisimforge.config import CONFIG;print(json.dumps(CONFIG,default=str))"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+            cwd=str(ADAPTER_DIR), env={**os.environ, "PYTHONIOENCODING": "utf-8",
+                                       "PYTHONPATH": str(ADAPTER_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")},
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+    except Exception:
+        pass
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
@@ -343,7 +361,27 @@ async def run_cli(argv: list[str], timeout_s: float = 300) -> dict[str, Any]:
     """Escape hatch: run an arbitrary multisimforge subcommand (JSON args only), e.g.
     ['decode','a.ms14','a.xml'] or ['sim','a.ms14','--tran','10m','--csv','out']. Prefer the
     typed tools; use this only for commands without a wrapper."""
-    return await asyncio.to_thread(_run_cli, [str(a) for a in argv], timeout_s)
+    args = [str(a) for a in argv]
+    blocked = _blocked(args)
+    if blocked:
+        return {"ok": False, "error": blocked, "status": "ERROR", "blocked": True}
+    return await asyncio.to_thread(_run_cli, args, timeout_s)
+
+
+DESTRUCTIVE = {
+    "com": "stopping the COM session drops the Multisim instance other tools are using",
+    "parts": "parts can overwrite the part library",
+}
+
+
+def _blocked(args: list[str]) -> str:
+    """Refuse the few subcommands that can destroy state outside the workspace."""
+    if not args:
+        return "no subcommand given"
+    if args[0] in DESTRUCTIVE:
+        return (f"'run_cli {args[0]}' is not allowed: {DESTRUCTIVE[args[0]]}. "
+                f"Use the typed tools, or run it yourself in a terminal.")
+    return ""
 
 
 def main() -> None:

@@ -87,6 +87,39 @@ class Circuit:
                 out.add(label)
         return out
 
+    def refdes_counts(self) -> dict:
+        """{refdes: times it appears on the sheet}; a real design never repeats one.
+
+        Ground symbols are all named "0" by Multisim, so they are not counted.
+        """
+        counts = {}
+        for it in self.comps.values():
+            name = xmlio.unasc(it[0].get("LocalName"))
+            if name in ("", "0"):
+                continue
+            counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    def dangling_wires(self):
+        """Wires whose ends are attached to nothing: a leftover of an interrupted edit.
+
+        A wire end names a pin connector (CODPinComp), a port, or a node, so all of
+        those count as attached; anything else means the wire hangs in the air.
+        """
+        attached = set(self.ports) | set(self.nodes)
+        for key, it in self.items.items():
+            if it.get("Class") == "CODPinComp":
+                attached.add(key)
+                attached.update(link.get("ID") for link in it[0].find("ConnectList"))
+        out = []
+        for key, it in self.wires.items():
+            ends = (it[0].get("Connect1"), it[0].get("Connect2"))
+            if not any(end in attached for end in ends):
+                points = it[0].find("Points")
+                pts = [(p.get("X"), p.get("Y")) for p in (points if points is not None else [])]
+                out.append((key, pts[0] if pts else ("?", "?")))
+        return out
+
     def graphic_groups(self):
         """Group component pins by the graphical connections of wires and junctions: [{component.pin, ...}, ...]."""
         parent = {}
@@ -124,6 +157,11 @@ def check_file(path, expected: dict | None = None) -> dict:
     root = xmlio.load(path)
     c = Circuit(root)
     problems = []
+    for name, count in sorted(c.refdes_counts().items()):
+        if count > 1:
+            problems.append(f"Reference designator {name} is used by {count} components; every component needs a unique one")
+    for key, point in c.dangling_wires():
+        problems.append(f"Wire {key} at {point[0]},{point[1]} is not attached to anything")
     nets = c.electrical_nets()
     port_net = {m: net for net, members in nets.items() for m in members}
     groups = c.graphic_groups()
@@ -153,7 +191,9 @@ def check_file(path, expected: dict | None = None) -> dict:
 
     # Layout
     warnings = []
-    diagram = next(root.iter("CIITDiagram"))
+    diagram = next(root.iter("CIITDiagram"), None)
+    if diagram is None:
+        raise ValueError(f"not a Multisim circuit: {path} has no CIITDiagram element")
     width = float(diagram.get("PageWidth", "11")) * 96
     height = float(diagram.get("PageHeight", "8.5")) * 96
     boxes = {}
@@ -183,11 +223,17 @@ def check_file(path, expected: dict | None = None) -> dict:
         net = xmlio.unasc(node[0].get("LocalName")).lower() if node is not None else "?"
         pts = [(float(p.get("X")), float(p.get("Y"))) for p in w[0].find("Points")]
         segs.extend((net, a, b) for a, b in zip(pts, pts[1:]))
-    crossings = 0
+    crossings, overlaps = 0, 0
     for i, (na, a, b) in enumerate(segs):
         for nb, p, q in segs[i + 1:]:
-            if na != nb and _cross(a, b, p, q):
+            if na == nb:
+                continue
+            if _cross(a, b, p, q):
                 crossings += 1
+            elif _overlap(a, b, p, q):
+                overlaps += 1                 # two nets drawn on top of each other short the circuit
+    if overlaps:
+        problems.append(f"Wires of different nets run on top of each other in {overlaps} places (a short circuit)")
     through = set()
     for net, a, b in segs:
         for name, (x0, y0, x1, y1) in boxes.items():
@@ -208,6 +254,15 @@ def _cross(a, b, p, q):
     (h1, h2), (v1, v2) = ((a, b), (p, q)) if a[1] == b[1] else ((p, q), (a, b))
     x, y = v1[0], h1[1]
     return (min(h1[0], h2[0]) < x < max(h1[0], h2[0])) and (min(v1[1], v2[1]) < y < max(v1[1], v2[1]))
+
+
+def _overlap(a, b, p, q):
+    """Two collinear segments of different nets share more than a point."""
+    if a[1] == b[1] == p[1] == q[1]:
+        return min(max(a[0], b[0]), max(p[0], q[0])) - max(min(a[0], b[0]), min(p[0], q[0])) > 0
+    if a[0] == b[0] == p[0] == q[0]:
+        return min(max(a[1], b[1]), max(p[1], q[1])) - max(min(a[1], b[1]), min(p[1], q[1])) > 0
+    return False
 
 
 def _seg_in_box(a, b, box):

@@ -13,6 +13,7 @@ spec fields:
                  every endpoint must land on a pin centre or coincide with another polyline, segments must be horizontal/vertical
     sheet        sheet size [width, height] in inches; defaults to a tight fit around the circuit
 """
+import hashlib
 import json
 import math
 import os
@@ -850,6 +851,10 @@ class Builder:
             s.set("WorkAreaTop", str(hh))
 
 
+SPEC_FIELDS = {"netlist", "output", "layout", "instruments", "sim_time", "net_names", "colors",
+               "wires", "wire_width", "sheet"}
+
+
 def _layout_key(layout: dict, refdes: str):
     for key in (refdes, refdes.upper(), "X" + refdes, refdes.lstrip("Xx")):
         if key in layout:
@@ -873,26 +878,50 @@ def build(spec: dict, lib: Library | None = None, allow_fallback: bool = False,
     except RouteError:
         if allow_fallback or not auto_repair:
             raise
-        best = None
+        out = Path(spec["output"]).resolve()       # only the repair loop needs a staging location
+        best = None                                # (score, result, staged_file)
+        staged = []                                # one file per candidate, committed only at the end
         deadline = time.monotonic() + repair_budget_s
-        for candidate, moves in _repair_variants(spec, max_repairs):
-            if time.monotonic() > deadline:
-                break                              # keep a failing build fast; report the best attempt so far
-            try:
-                result = _build_once(candidate, lib, allow_fallback)
-            except RouteError:
-                continue
-            result["moved_parts"] = moves
-            moved = ", ".join(f"{name} by ({dx:+g},{dy:+g})" for name, (dx, dy) in moves.items())
-            result["warnings"] = list(result["warnings"]) + [f"layout auto-repaired: moved {moved} so the router could pass"]
-            score = _repair_score(result)
-            if score == 0:
-                return result                      # routed cleanly with nothing left to report
-            if best is None or score < best[0]:
-                best = (score, result)
-        if best is not None:
-            return best[1]
-        raise
+        try:
+            for index, (candidate, moves) in enumerate(_repair_variants(spec, max_repairs)):
+                if time.monotonic() > deadline:
+                    break                          # keep a failing build fast; report the best attempt so far
+                attempt = out.with_name(f".{out.stem}.repair-{index}{out.suffix}")
+                try:
+                    result = _build_once(candidate, lib, allow_fallback, out=attempt)
+                except RouteError:
+                    continue
+                staged.append(attempt)
+                result["moved_parts"] = moves
+                moved = ", ".join(f"{name} by ({dx:+g},{dy:+g})" for name, (dx, dy) in moves.items())
+                result["warnings"] = list(result["warnings"]) + [f"layout auto-repaired: moved {moved} so the router could pass"]
+                score = _repair_score(result)
+                if score == 0:
+                    if best is not None:
+                        best[2].unlink(missing_ok=True)
+                    _commit(attempt, out, result)
+                    return result                  # routed cleanly with nothing left to report
+                if best is None or score < best[0]:
+                    if best is not None:
+                        best[2].unlink(missing_ok=True)
+                    best = (score, result, attempt)
+                else:
+                    attempt.unlink(missing_ok=True)
+            if best is not None:
+                _commit(best[2], out, result=best[1])
+                return best[1]
+            raise
+        finally:
+            for path in staged:
+                path.unlink(missing_ok=True)
+
+
+def _commit(source: Path, target: Path, result: dict) -> None:
+    """Move the winning candidate into place and make the result describe the file that is really there."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(source, target)
+    result["ms14"] = str(target)
+    result["sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
 
 
 def _repair_score(result: dict) -> int:
@@ -945,11 +974,18 @@ def _repair_variants(spec: dict, limit: int):
             yield candidate, {label: (dx, dy)}
 
 
-def _build_once(spec: dict, lib: Library, allow_fallback: bool) -> dict:
+def _build_once(spec: dict, lib: Library, allow_fallback: bool, out=None) -> dict:
     run_id = new_run_id()
-    out = Path(spec["output"]).resolve()
-    if not re.fullmatch(r"[A-Za-z0-9_\-]+", out.stem) or out.suffix.lower() != ".ms14":
+    missing = [k for k in ("netlist", "output") if not spec.get(k)]
+    if missing:
+        raise ValueError(f"spec is missing required field(s): {', '.join(missing)}")
+    unknown = sorted(set(spec) - SPEC_FIELDS)
+    if unknown:
+        raise ValueError(f"spec has unknown field(s) {unknown}; valid fields are {sorted(SPEC_FIELDS)}")
+    final = Path(spec["output"]).resolve()
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", final.stem) or final.suffix.lower() != ".ms14":
         raise ValueError("output must be .ms14 with a file name of letters, digits, underscore and hyphen only")
+    out = Path(out).resolve() if out else final
     instances = nl.parse(spec["netlist"])
     layout = spec.get("layout") or {}
     b = Builder(lib, out)

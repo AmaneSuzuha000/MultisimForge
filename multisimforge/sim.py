@@ -244,6 +244,9 @@ def run(ms14: str, nets: list, op=False, ac=None, tran=None, ac_out=None, ac_in=
     result = {"outputs": outputs}
     for a in raw["results"]:
         if a["missing"]:
+            result.setdefault("missing", []).extend(a["missing"])
+            result.setdefault("failures", []).append(
+                f"{a['type']} analysis did not return {', '.join(a['missing'])}: {a['last_error']}")
             result.setdefault("warnings", []).append(f"{a['type']} analysis did not return {a['missing']}: {a['last_error']}")
         data = {by_output[k]: rows for k, rows in a["data"].items()}
         if a["type"] == "op":
@@ -284,12 +287,21 @@ def _write_csv(path: Path, header, rows):
 
 def spice(netlist_text: str, commands: list) -> dict:
     """Hand arbitrary SPICE text to Multisim's command-line simulation engine (DoCommandLine)."""
+    from .result import new_run_id
     work = Path(CONFIG["work_dir"]) / "spice"
     if " " in str(work):
         raise ValueError("work_dir must not contain spaces (limitation of the Multisim command-line engine)")
+    work = work / new_run_id()                    # one directory per run, so concurrent runs cannot overwrite each other
+    work.mkdir(parents=True, exist_ok=True)
     res = com.call({"op": "spice", "netlist": netlist_text, "commands": commands, "work": str(work)})
-    if res.get("raw"):
-        res["vectors"] = read_raw(res["raw"])
+    raw = Path(res["raw"]) if res.get("raw") else None
+    if raw is None or not raw.is_file():
+        res.setdefault("failures", []).append("the simulation engine produced no result file (result.raw)")
+        return res
+    try:
+        res["vectors"] = read_raw(raw)
+    except (OSError, ValueError, StopIteration) as exc:
+        res.setdefault("failures", []).append(f"result file is unreadable: {exc}")
     return res
 
 

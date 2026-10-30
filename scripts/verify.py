@@ -57,6 +57,20 @@ def offline():
 
     record("netlist parser", netlist.parse_value("4.7k") == 4700)
     record("netlist pin syntax", netlist.parse("U1 LM555CN OUT=out\n")[0].named == {"OUT": "out"})
+    record("RKM values", netlist.parse_value("1k2") == 1200 and netlist.parse_value("4u7") == 4.7e-6)
+    try:
+        netlist.parse_value("1k5junk")
+        strict = False
+    except ValueError:
+        strict = True
+    record("value rejects trailing garbage", strict, "1k5junk -> ValueError")
+
+    try:
+        codec.decode(b"not a design")
+        guarded = False
+    except ValueError:
+        guarded = True
+    record("codec rejects a corrupt file", guarded, "ValueError, not struct.error")
 
     for name in ("rc_lowpass.json", "phase_lead.json", "explicit_wiring.json"):
         spec = json.loads((ROOT / "examples" / name).read_text(encoding="utf-8"))

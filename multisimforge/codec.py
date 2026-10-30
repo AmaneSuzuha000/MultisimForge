@@ -10,6 +10,8 @@ MAGIC = b"MSMCompressedElectronicsWorkbenchXML"
 SECTION = 900_000
 WINDOW = 4096          # 6 low bits of the dictionary → maximum distance 4096
 MAX_LEN = 518          # 519 is the end code
+MAX_SECTION = 4 * SECTION        # a section may never be bigger than a few chunks
+MAX_FILE = 256 * 1024 * 1024     # refuse to allocate more than this for one design
 
 CH_BITS_ASC = (
     11, 12, 12, 12, 12, 12, 12, 12, 12, 8, 7, 12, 12, 7, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
@@ -180,22 +182,40 @@ def implode(data: bytes) -> bytes:
     return bytes(out)
 
 
-def decode(data: bytes) -> bytes:
-    """.ms14 file contents → XML bytes."""
+def decode(data: bytes, *, max_bytes: int = MAX_FILE, max_section: int = MAX_SECTION) -> bytes:
+    """.ms14 file contents → XML bytes.
+
+    A .ms14 declares its own uncompressed size, so a corrupt or hostile file could ask
+    for an unbounded allocation. Both the declared total and every section are capped,
+    and no section may read past the end of the file.
+    """
     if not data.startswith(MAGIC):
         raise ValueError("Not a Multisim compressed file (missing MSMCompressedElectronicsWorkbenchXML header)")
-    total = struct.unpack_from("<Q", data, len(MAGIC))[0]
-    pos = len(MAGIC) + 8
+    head = len(MAGIC) + 8
+    if len(data) < head:
+        raise ValueError("corrupt .ms14: the header is truncated")
+    total = struct.unpack_from("<Q", data, head - 8)[0]
+    if total > max_bytes:
+        raise ValueError(f"corrupt or oversized .ms14: it declares {total} bytes of XML, the limit is {max_bytes}")
+    pos = head
     parts, size = [], 0
     while size < total:
+        if pos + 8 > len(data):
+            raise ValueError("corrupt .ms14: a section header is truncated")
         raw_len, comp_len = struct.unpack_from("<II", data, pos)
         pos += 8
+        if raw_len > max_section:
+            raise ValueError(f"corrupt or oversized .ms14: a section declares {raw_len} bytes, the limit is {max_section}")
+        if comp_len > len(data) - pos:
+            raise ValueError("corrupt .ms14: a section is longer than the file")
         part = explode(data[pos:pos + comp_len])
         if len(part) != raw_len:
             raise ValueError(f"Section length mismatch: expected {raw_len}, got {len(part)}")
         parts.append(part)
         size += raw_len
         pos += comp_len
+    if size != total:
+        raise ValueError(f"corrupt .ms14: sections add up to {size} bytes, the header says {total}")
     return b"".join(parts)
 
 

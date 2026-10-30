@@ -53,18 +53,24 @@ def top_windows(pid=None):
     return found
 
 
-def find_main(stem: str, candidates: list | None = None):
-    """Main window for a design name.
+def design_windows(stem: str):
+    """Every visible Multisim main window whose title carries [stem]."""
+    return [(hwnd, pid) for hwnd, title, cls, pid in top_windows()
+            if cls.startswith("Multisim") and f"[{stem}]" in title]
 
-    Titles only carry the file stem, so two different folders holding the same
-    file name are indistinguishable from the title alone. Every candidate is
-    returned in *candidates*; the caller decides whether the design is ambiguous.
+
+def capture_copy(source: Path, work: Path) -> Path:
+    """Copy the design into *work*, keeping its name.
+
+    The window title carries only the file stem, and the 14.3 automation interface
+    exposes no open-path property (IMultisimApp has no Circuits collection), so a
+    title can never prove which file it shows. Instead of trying, capture refuses to
+    reuse a window that was already open: it always starts its own, so any window
+    with this stem must be the copy it just launched.
     """
-    found = [(hwnd, pid) for hwnd, title, cls, pid in top_windows()
-             if cls.startswith("Multisim") and f"[{stem}]" in title]
-    if candidates is not None:
-        candidates[:] = found
-    return (found[0] if found else (None, None))
+    copy = work / source.name
+    copy.write_bytes(source.read_bytes())
+    return copy
 
 
 def grab(hwnd: int) -> Image.Image:
@@ -278,23 +284,27 @@ def arrange_panels(main: int, pid: int, view: Image.Image):
 
 def open_design(ms14: Path):
     """Return (main window, process ID, whether it was launched by this call)."""
-    candidates = []
-    main, pid = find_main(ms14.stem, candidates)
-    if len(candidates) > 1:
+    existing = design_windows(ms14.stem)
+    if existing:
         raise RuntimeError(
-            f"{len(candidates)} Multisim windows are open for a design named {ms14.stem!r} "
-            f"(pids {sorted({p for _, p in candidates})}); close the others first so the capture cannot "
-            f"pick a different file with the same name")
-    launched = main is None
-    if launched:
-        subprocess.Popen([CONFIG["multisim_exe"], str(ms14)])
-        deadline = time.time() + 120
-        while main is None and time.time() < deadline:
-            time.sleep(1)
-            main, pid = find_main(ms14.stem)
-        if main is None:
-            raise RuntimeError("Timed out waiting for the Multisim window")
-        time.sleep(3)
+            f"{len(existing)} Multisim window(s) are already open for a design named {ms14.stem!r} "
+            f"(pids {sorted({p for _, p in existing})}). Capture cannot tell which file such a window "
+            f"shows, so close it first; capture opens its own copy and closes it afterwards")
+    main, pid = None, None
+    subprocess.Popen([CONFIG["multisim_exe"], str(ms14)])
+    deadline = time.time() + 120
+    while main is None and time.time() < deadline:
+        time.sleep(1)
+        found = design_windows(ms14.stem)
+        if len(found) > 1:
+            raise RuntimeError(
+                f"{len(found)} Multisim windows appeared for {ms14.stem!r}; close the extra ones and retry")
+        if found:
+            main, pid = found[0]
+    if main is None:
+        raise RuntimeError("Timed out waiting for the Multisim window")
+    time.sleep(3)
+    launched = True
     win32gui.ShowWindow(main, win32con.SW_MAXIMIZE)
     time.sleep(1)
     send_key(main, win32con.VK_F7)                    # Zoom to fit the entire drawing
@@ -302,8 +312,9 @@ def open_design(ms14: Path):
     return main, pid, launched
 
 
-def run_once(ms14: Path, out: Path, wait: float, timeout: float, on_netlist_error: str = "abort"):
-    stem = ms14.stem
+def run_once(ms14: Path, out: Path, wait: float, timeout: float, on_netlist_error: str = "abort",
+             stem: str | None = None):
+    stem = stem or ms14.stem                      # the original name drives the file names we write
     main, pid, launched = open_design(ms14)
     result = {"ms14": str(ms14), "images": {}, "warnings": [], "netlist_errors": []}
     send_key(main, win32con.VK_F5)
@@ -417,27 +428,30 @@ def capture(ms14, outdir, wait=1.5, timeout=90, keep_open=False, on_netlist_erro
     run_id = new_run_id()
     work = Path(CONFIG["work_dir"]) / "capture" / run_id
     work.mkdir(parents=True, exist_ok=True)
-    copy = work / source.name
-    copy.write_bytes(source.read_bytes())
+    copy = capture_copy(source, work)          # unique stem: the window title is then unambiguous
     input_sha = hashlib.sha256(source.read_bytes()).hexdigest()
 
     sim_time, sweep = sweep_info(copy)
-    result, pid, launched, worst = run_once(copy, out, wait, timeout, on_netlist_error)
-    if worst < 0.9 and launched and sim_time and sweep and sim_time < 1e20:
-        # The sweep start is fixed for a given circuit: extend the end time until this screen is almost fully swept, then run again
-        _close(pid)
-        time.sleep(2)
-        new_time = sim_time + (0.99 - worst) * sweep
-        set_sim_time(copy, new_time)          # only the working copy is retimed
-        first = result
-        result, pid, launched, worst = run_once(copy, out, wait, timeout, on_netlist_error)
-        result["warnings"] = first["warnings"] + result["warnings"]
-        result["netlist_errors"] = first["netlist_errors"] + result["netlist_errors"]
-        result["sim_time_adjusted"] = new_time
-    if worst < 0.9:
-        result["warnings"].append(f"Oscilloscope waveform covers only {worst:.0%} of the screen; increase sim_time, then regenerate and re-capture")
-    if launched and not keep_open:
-        _close(pid)
+    pid, launched = None, False
+    try:
+        result, pid, launched, worst = run_once(copy, out, wait, timeout, on_netlist_error, stem=source.stem)
+        if worst < 0.9 and launched and sim_time and sweep and sim_time < 1e20:
+            # The sweep start is fixed for a given circuit: extend the end time until this screen is almost fully swept, then run again
+            _close(pid)
+            pid = None
+            time.sleep(2)
+            new_time = sim_time + (0.99 - worst) * sweep
+            set_sim_time(copy, new_time)          # only the working copy is retimed
+            first = result
+            result, pid, launched, worst = run_once(copy, out, wait, timeout, on_netlist_error, stem=source.stem)
+            result["warnings"] = first["warnings"] + result["warnings"]
+            result["netlist_errors"] = first["netlist_errors"] + result["netlist_errors"]
+            result["sim_time_adjusted"] = new_time
+        if worst < 0.9:
+            result["warnings"].append(f"Oscilloscope waveform covers only {worst:.0%} of the screen; increase sim_time, then regenerate and re-capture")
+    finally:
+        if launched and not keep_open and pid:
+            _close(pid)                   # a failed run must not leave a Multisim window behind
 
     after_sha = hashlib.sha256(source.read_bytes()).hexdigest()
     result.update({

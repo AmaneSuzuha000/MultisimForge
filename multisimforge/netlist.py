@@ -19,7 +19,14 @@ from dataclasses import dataclass, field
 
 SUFFIX = {"t": 1e12, "g": 1e9, "meg": 1e6, "k": 1e3, "": 1.0, "m": 1e-3, "u": 1e-6, "µ": 1e-6,
           "n": 1e-9, "p": 1e-12, "f": 1e-15}
-_NUM = re.compile(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(meg|[tgkmuµnpf]?)", re.I)
+_MULT = r"meg|[tgkmuµnpf]"
+# Unit words a value may carry without changing it (1kohm, 10mV, 5Hz). Anything else is a typo.
+_UNITS = {"", "ohm", "ohms", "f", "farad", "farads", "h", "henry", "henries", "v", "volt", "volts",
+          "a", "amp", "amps", "ampere", "amperes", "w", "watt", "watts", "hz", "s", "sec", "secs",
+          "second", "seconds"}
+_NUM = re.compile(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(" + _MULT + r")?\s*([a-z]*)$", re.I)
+# Engineering notation where the multiplier replaces the decimal point: 1k2 = 1.2k, 4u7 = 4.7u.
+_RKM = re.compile(r"^([+-]?\d+)(" + _MULT + r")(\d+)\s*([a-z]*)$", re.I)
 
 # Instruments: netlist keyword -> part library name, positional pin order (port names)
 INSTRUMENTS = {
@@ -32,17 +39,29 @@ NODE_COUNT = {"R": 2, "C": 2, "L": 2, "V": 2, "I": 2, "D": 2, "Q": 3, "J": 3, "M
 
 
 def parse_value(token) -> float:
-    """Value: 4.7k, 100n, 1meg, 10mV (unit letters are ignored).
+    """Value: 4.7k, 100n, 1meg, 10mV, 1k2 (the whole token must be a value).
 
      Case-sensitive like the Multisim UI: M is mega (1MHz, 1MOhm), m is milli; meg is mega in any case.
+     A trailing unit word is allowed (1kohm, 10mV, 5Hz); any other trailing text is an error, so a
+     typo such as 1kgarbage or 4.7kjunk is rejected instead of silently becoming 1k.
     """
     if isinstance(token, (int, float)):
         return float(token)
-    m = _NUM.match(str(token).strip())
+    text = str(token).strip()
+    m = _RKM.match(text)
+    if m:
+        whole, mult, frac, unit = m.groups()
+        if unit.lower() not in _UNITS:
+            raise ValueError(f"cannot parse value {token!r}")
+        scale = 1e6 if mult == "M" else SUFFIX[mult.lower()]
+        return float(f"{whole}.{frac}") * scale
+    m = _NUM.match(text)
     if not m:
         raise ValueError(f"cannot parse value {token!r}")
-    suffix = m.group(2)
-    return float(m.group(1)) * (1e6 if suffix == "M" else SUFFIX[suffix.lower()])
+    number, mult, unit = m.group(1), m.group(2) or "", m.group(3)
+    if unit.lower() not in _UNITS:
+        raise ValueError(f"cannot parse value {token!r}")
+    return float(number) * (1e6 if mult == "M" else SUFFIX[mult.lower()])
 
 
 def net_name(token: str) -> str:

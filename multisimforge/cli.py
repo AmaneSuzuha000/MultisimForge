@@ -4,6 +4,7 @@ Every command prints one JSON envelope to stdout and exits with the code that
 matches its status (see multisimforge/result.py): 0 PASS/WARN, 2 FAIL, 1 ERROR.
 """
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -14,6 +15,16 @@ from .result import Status, exit_code_for, worst
 def _out(payload, status=Status.PASS):
     from .result import envelope
     print(json.dumps(envelope(payload, status), ensure_ascii=False, indent=1, default=str))
+
+
+def _positive(text):
+    """A duration that cannot be zero or negative."""
+    value = float(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0, got {text}")
+    if value > 3600:
+        raise argparse.ArgumentTypeError(f"must be at most 3600 seconds, got {text}")
+    return value
 
 
 def _floats(text, n=None):
@@ -76,7 +87,12 @@ def _pin_xy(lib, key):
 def cmd_build(a):
     from . import builder, check, com
     from .router import RouteError
-    spec = json.loads(Path(a.spec).read_text(encoding="utf-8"))
+    try:
+        spec = json.loads(Path(a.spec).read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        raise ValueError(f"{a.spec} is not UTF-8 text; save the spec as UTF-8") from None
+    if not isinstance(spec, dict):
+        raise ValueError(f"{a.spec} must contain one JSON object")
     try:
         r = builder.build(spec, allow_fallback=a.allow_fallback, auto_repair=not a.no_auto_repair)
     except RouteError as exc:
@@ -86,6 +102,7 @@ def cmd_build(a):
     warnings = r["warnings"] + report["warnings"]
     payload = {
         "ms14": r["ms14"],
+        "sha256": r.get("sha256") or hashlib.sha256(Path(r["ms14"]).read_bytes()).hexdigest(),
         "run_id": r.get("run_id"),
         "sim_time": r["sim_time"],
         "warnings": warnings,
@@ -137,7 +154,7 @@ def cmd_sim(a):
         raise ValueError("choose at least one analysis: --op / --ac / --tran")
     r = sim.run(a.ms14, nets, op=a.op, ac=ac, tran=tran, ac_out=a.out, ac_in=getattr(a, "in"),
                 at=_floats(a.at) if a.at else (), csv_dir=a.csv)
-    return r, Status.PASS
+    return r, sim_status(r)
 
 
 def cmd_spice(a):
@@ -147,7 +164,17 @@ def cmd_spice(a):
     if vectors:
         r["vectors"] = {k: {"points": len(v), "first": v[0] if not isinstance(v[0], complex) else str(v[0]),
                             "last": v[-1] if not isinstance(v[-1], complex) else str(v[-1])} for k, v in vectors.items()}
-    return r, Status.PASS
+    return r, sim_status(r, require_vectors=True)
+
+
+def sim_status(payload: dict, require_vectors: bool = False):
+    """A simulation only passes when it produced data: missing required output is a failure, not a warning."""
+    missing = payload.get("missing") or []
+    if missing or payload.get("failures"):
+        return Status.FAIL
+    if require_vectors and not payload.get("vectors"):
+        return Status.FAIL
+    return Status.WARN if payload.get("warnings") else Status.PASS
 
 
 def cmd_capture(a):
@@ -182,7 +209,7 @@ def cmd_codec(a):
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8")
-    p = argparse.ArgumentParser(prog="multisimforge",
+    p = argparse.ArgumentParser(prog="multisimforge", add_help=True,
                                 description="Control NI Multisim 14 in text: generate circuits, preview, run simulations and read data, take real screenshots")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -236,8 +263,8 @@ def main(argv=None):
     s = sub.add_parser("capture", help="open Multisim, run the simulation, and capture the circuit, instrument panels, and full screen")
     s.add_argument("ms14")
     s.add_argument("outdir")
-    s.add_argument("--wait", type=float, default=1.5, help="how long the display must be still to consider the simulation finished (seconds)")
-    s.add_argument("--timeout", type=float, default=90, help="maximum wait (seconds)")
+    s.add_argument("--wait", type=_positive, default=1.5, help="how long the display must be still to consider the simulation finished (seconds)")
+    s.add_argument("--timeout", type=_positive, default=90, help="maximum wait (seconds)")
     s.add_argument("--keep-open", action="store_true", help="do not close Multisim after capturing")
     s.add_argument("--on-netlist-error", choices=["abort", "continue"], default="abort",
                    help="what to do when Multisim reports a netlist error (default: abort and fail)")
@@ -264,8 +291,13 @@ def main(argv=None):
     except KeyboardInterrupt:
         _out({"error": "cancelled"}, Status.CANCELLED)
         sys.exit(exit_code_for(Status.CANCELLED))
-    except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
+    except (ValueError, KeyError, FileNotFoundError, RuntimeError, OSError, EOFError, StopIteration) as exc:
         _out({"error": f"{type(exc).__name__}: {exc}"}, Status.ERROR)
+        sys.exit(exit_code_for(Status.ERROR))
+    except Exception as exc:                      # never let a traceback replace the envelope
+        if "--debug" in (argv if argv is not None else sys.argv[1:]):
+            raise
+        _out({"error": f"{type(exc).__name__}: {exc}", "detail": "run with --debug for a traceback"}, Status.ERROR)
         sys.exit(exit_code_for(Status.ERROR))
     status = worst([status])
     _out(payload, status)
