@@ -367,6 +367,10 @@ def run_once(ms14: Path, out: Path, wait: float, timeout: float, on_netlist_erro
     crop_ink(view).save(out / f"{stem}_circuit.png")
     result["images"]["circuit"] = str(out / f"{stem}_circuit.png")
     # Full-screen capture: grab the screen after bringing Multisim to the foreground; panels overlay the circuit window at their real positions
+    # The panel images above come from PrintWindow, which renders an occluded window. This one
+    # composites the real desktop, so it needs Multisim on top: the end user's cursor and any
+    # other window would otherwise be baked into the picture. It is the only step that borrows
+    # the foreground, and it is skipped rather than faked when the foreground cannot be taken.
     if bring_to_front(main):
         arrange_panels(main, pid, view)
         time.sleep(0.8)
@@ -374,7 +378,9 @@ def run_once(ms14: Path, out: Path, wait: float, timeout: float, on_netlist_erro
         ImageGrab.grab(bbox=(max(l, 0), max(t, 0), r, b), all_screens=True).save(out / f"{stem}_screen.png")
         result["images"]["screen"] = str(out / f"{stem}_screen.png")
     else:
-        result["warnings"].append("Could not bring Multisim to the foreground (do not touch the mouse or keyboard while capturing); no full-screen capture was generated")
+        result["warnings"].append(
+            "Could not bring Multisim to the foreground, so no desktop screenshot was taken "
+            "(the circuit and panel images above are unaffected); leave the mouse and keyboard alone while capturing")
     return result, pid, launched, worst
 
 

@@ -853,6 +853,7 @@ class Builder:
 
 SPEC_FIELDS = {"netlist", "output", "layout", "instruments", "sim_time", "net_names", "colors",
                "wires", "wire_width", "sheet"}
+REPAIR_BUDGET_PER_CANDIDATE = 0.5      # seconds; a routed candidate takes about 0.2 s
 
 
 def _layout_key(layout: dict, refdes: str):
@@ -863,7 +864,7 @@ def _layout_key(layout: dict, refdes: str):
 
 
 def build(spec: dict, lib: Library | None = None, allow_fallback: bool = False,
-          auto_repair: bool = True, max_repairs: int = 48, repair_budget_s: float = 3.0) -> dict:
+          auto_repair: bool = True, max_repairs: int = 48, repair_budget_s: float | None = None) -> dict:
     """Build a .ms14 from a spec, trying to make the layout routable before failing.
 
     Degraded routing (a wire with no obstacle-free path) is an error. Before
@@ -881,6 +882,12 @@ def build(spec: dict, lib: Library | None = None, allow_fallback: bool = False,
         out = Path(spec["output"]).resolve()       # only the repair loop needs a staging location
         best = None                                # (score, result, staged_file)
         staged = []                                # one file per candidate, committed only at the end
+        # A budget of "3 seconds" is arbitrary when one candidate costs a fraction of a
+        # second: it cuts the search off before the blocker that actually matters comes
+        # up. The default is a per-candidate allowance, so the search always covers the
+        # candidate list it was given.
+        if repair_budget_s is None:
+            repair_budget_s = REPAIR_BUDGET_PER_CANDIDATE * max_repairs
         deadline = time.monotonic() + repair_budget_s
         try:
             for index, (candidate, moves) in enumerate(_repair_variants(spec, max_repairs)):
@@ -950,8 +957,11 @@ def _repair_variants(spec: dict, limit: int):
         if isinstance(pos, list) and len(pos) >= 2 and isinstance(pos[0], (int, float)) and str(name).upper() != "GND":
             boxes.append((float(pos[0]), float(pos[1]), 126.0, 108.0))
     made = 0
-    for kind, key in targets:
-        for dx, dy in offsets:
+    # Breadth first: give every movable object its smallest nudge before deepening any
+    # single one. Trying one object's twelve offsets in a row exhausts the budget on a
+    # blocker that is not the cause, and the object that is the cause never gets a turn.
+    for dx, dy in offsets:
+        for kind, key in targets:
             if made >= limit:
                 return
             candidate = json.loads(json.dumps(spec))
@@ -1053,7 +1063,7 @@ def _build_once(spec: dict, lib: Library, allow_fallback: bool, out=None) -> dic
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(f".{out.name}.tmp-{run_id}")
     try:
-        xmlio.save(b.root, tmp)
+        xmlio.save(b.root, tmp, compress=out.suffix.lower() == ".ms14")
         os.replace(tmp, out)          # atomic: a failed build never leaves a half-written .ms14
     finally:
         if tmp.exists():

@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-10-30
+
+Follow-up to 0.1.3, which introduced a regression and left the auto-repair search unable
+to reach the part that was actually in the way. The "Known limitations" section was
+rewritten after checking each entry against a real Multisim instead of restating it.
+
+### Fixed
+
+- **`build` wrote plain XML into a `.ms14` file.** 0.1.3 staged every write through
+  `.rc.ms14.tmp-<run_id>` and the container was chosen from the file suffix, so the
+  staged file was written as text and then moved into place: Multisim refused to open the
+  result. No test noticed, because every reader in the suite happily accepts plain XML.
+  The caller now states the container, and the output is checked against the `.ms14`
+  magic bytes.
+- **Layout auto-repair never reached the blocking part.** It tried one object's twelve
+  offsets in a row inside a flat three-second budget, so with four movable objects the
+  budget was gone after the first two. A layout that routes after moving `GND[3]` by
+  (0, 24) failed with "no obstacle-free route", even though 5 of the 48 candidates route.
+  The search is now breadth first and its budget is per candidate.
+
+### Changed
+
+- `parts fetch`: a Multisim process that dies inside `ReplaceComponent` (0xC0000374) now
+  restarts the COM instance and retries once. The crash is intermittent and depends on the
+  state of the running instance, not on the carrier circuit.
+- `capture`: the foreground is taken only for the desktop screenshot; if it cannot be
+  taken, that one image is skipped with a warning instead of failing the run.
+- `README`: "Known limitations" states what was measured — cursor positions are in the
+  file but Multisim 14.3 ignores them, and `PRINTWINDOW` lets the panel images work with
+  the window covered.
+
+### Added
+
+- `tests/test_container.py`: a built design must start with the `.ms14` magic bytes.
+- `tests/test_repair_order.py`: the repair search must reach every movable object.
+
 ## [0.1.3] - 2026-10-30
 
 Correctness release, driven by a line-by-line re-audit of 0.1.2. Every entry below

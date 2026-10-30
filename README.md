@@ -221,11 +221,29 @@ The offline suite covers the container codec, XML round-trips, the netlist parse
 
 ## Known limitations
 
-- Scope and bode cursors cannot be preset, so they sit at the start of the trace in screenshots; take readings from `sim` instead.
-- Multi-section parts (LM324, 74LS00, ...) use only section A per instance; digital parts keep VCC/GND on hidden pins.
-- Routing is automatic A*, so dense circuits can still detour — move coordinates or switch to `wires`; the `crossings` count is the metric to optimise.
-- `parts fetch` drives a real Multisim and replaces a part in a carrier circuit; an incompatible carrier can crash that process (leftovers are cleaned up automatically).
-- `capture` brings Multisim to the foreground, so leave the mouse and keyboard alone for about a minute.
+- **Scope and bode cursors cannot be preset.** The design file does carry the cursor
+  positions (`NI_EWB_CURRENTDISPLAYDATA_CURSORPOS_0/1`), and they survive a save, but
+  Multisim 14.3 ignores the stored value when it opens the design: a file written with
+  T1 = 1.5 ms, T2 = 3 ms opens with both cursors at 0 s, and requesting a restore through
+  `NI_EWB_HASSERIALIZERESTOREDATA` changes nothing. Take readings from `sim`, which
+  asks the simulator instead of the screen.
+- **Multi-section parts (LM324, 74LS00, ...) use only section A per instance**, and digital
+  parts keep VCC/GND on hidden pins. The generator writes one symbol per instance.
+- **Routing is automatic A*,** so dense circuits can still detour — move coordinates or
+  switch to `wires`; the `crossings` count is the metric to optimise. When a layout has no
+  legal route at all, the build fails and names the nets rather than shipping a drawing with
+  wires through parts. Overlapping parts are the usual cause, and the only fix is to move a
+  part, so auto-repair reports every move it makes.
+- **`parts fetch` can crash Multisim.** ReplaceComponent occasionally corrupts the
+  process heap (0xC0000374) and Multisim exits. It depends on the state of the running
+  instance rather than on the carrier circuit — the same fetch failed twice and then
+  succeeded three times in a row after the instance was restarted. A crash now restarts the
+  COM instance and retries once before reporting.
+- **`capture` takes the foreground for the desktop screenshot.** The circuit and panel
+  images come from `PrintWindow` and work with Multisim covered, but the full-screen image
+  composites the real desktop, so it needs Multisim on top: leave the mouse and keyboard
+  alone for about a minute. If the foreground cannot be taken, that one image is skipped
+  with a warning and the others are still written.
 
 ## License
 

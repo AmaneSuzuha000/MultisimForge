@@ -77,11 +77,18 @@ def load(path) -> ET.Element:
         raise ValueError(f"{path} is not a Multisim design (invalid XML: {exc})") from None
 
 
-def save(root: ET.Element, path) -> None:
-    """Write .ms14 (compressed) or .xml depending on the extension."""
+def save(root: ET.Element, path, compress: bool | None = None) -> None:
+    """Write a design: compressed .ms14 by default, plain XML for an .xml path.
+
+    *compress* overrides the guess. Writing to a temporary file whose name ends in
+    ".tmp-<id>" loses the .ms14 suffix, so callers that stage a write must say which
+    container they want instead of relying on the extension.
+    """
     data = to_text(root).encode("utf-8")
     path = Path(path)
-    path.write_bytes(codec.encode(data) if path.suffix.lower() == ".ms14" else data)
+    if compress is None:
+        compress = path.suffix.lower() == ".ms14"
+    path.write_bytes(codec.encode(data) if compress else data)
 
 
 def asc(value) -> str:

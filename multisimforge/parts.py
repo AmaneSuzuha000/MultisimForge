@@ -338,6 +338,26 @@ def db_lookup(lib: Library, name: str):
     return hit
 
 
+def _replace_with_restart(carrier, ref, group, family, name, out, tried):
+    """Run one replacement, restarting the COM instance once if Multisim dies mid-job.
+
+    0xC0000374 (heap corruption) inside ReplaceComponent leaves the daemon holding a dead
+    instance, and every later job then fails the same way. Restarting the instance and
+    retrying recovers it: a fetch that failed twice in a row succeeded on a fresh daemon.
+    """
+    from . import com
+    job = {"op": "replace", "ms14": str(carrier), "ref": ref, "group": group,
+           "family": family, "name": name, "out": str(out)}
+    try:
+        return com.call(job, timeout=180)
+    except com.ComError as exc:
+        if "3221226356" not in str(exc) and "0xc0000374" not in str(exc).lower():
+            raise
+    com.stop()                                        # drop the instance that Multisim corrupted
+    tried.append(f"{ref}: Multisim crashed (0xC0000374) inside ReplaceComponent; restarted the instance and retried")
+    return com.call(job, timeout=180)
+
+
 def fetch(name: str, lib: Library, group=None, family=None) -> dict:
     from . import builder, com
     if lib.resolve(name):
@@ -346,14 +366,19 @@ def fetch(name: str, lib: Library, group=None, family=None) -> dict:
         group, family = db_lookup(lib, name)
     work = Path(CONFIG["work_dir"]) / "fetch"
     work.mkdir(parents=True, exist_ok=True)
+    # ReplaceComponent can crash the Multisim process outright (0xC0000374, heap corruption).
+    # It does so intermittently and depends on the state of the running instance, not on the
+    # carrier: fetching LM7805CT failed twice on a reused daemon instance and then succeeded
+    # three times in a row once the daemon was fresh. A crash therefore restarts the instance
+    # and retries once before it is reported, and the report says the process died rather than
+    # leaving the generic exit code in place.
     tried = []
     for ref, line in CARRIERS:
         carrier = work / f"carrier_{ref}.ms14"
         builder.build({"netlist": line, "output": str(carrier), "layout": {ref: [300, 300]}}, lib)
         out = work / f"{safe_name(name)}.ms14"
         try:
-            com.call({"op": "replace", "ms14": str(carrier), "ref": ref, "group": group,
-                      "family": family, "name": name, "out": str(out)}, timeout=180)
+            _replace_with_restart(carrier, ref, group, family, name, out, tried)
         except com.ComError as exc:
             tried.append(f"{ref}: {exc}")
             continue
