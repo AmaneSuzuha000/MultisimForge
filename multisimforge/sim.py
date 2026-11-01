@@ -250,13 +250,24 @@ def run(ms14: str, nets: list, op=False, ac=None, tran=None, ac_out=None, ac_in=
     raw = com.call({"op": "analyze", "ms14": str(probe_file), "analyses": analyses})
     by_output = {v: k for k, v in outputs.items()}
     result = {"outputs": outputs}
-    for a in raw["results"]:
+    if not raw.get("results"):
+        result.setdefault("failures", []).append("simulator returned no analysis results")
+    for a in raw.get("results", []):
         if a["missing"]:
             result.setdefault("missing", []).extend(a["missing"])
             result.setdefault("failures", []).append(
                 f"{a['type']} analysis did not return {', '.join(a['missing'])}: {a['last_error']}")
             result.setdefault("warnings", []).append(f"{a['type']} analysis did not return {a['missing']}: {a['last_error']}")
         data = {by_output[k]: rows for k, rows in a["data"].items()}
+        if not data:
+            result.setdefault("failures", []).append(f"{a['type']} analysis returned no measured vectors")
+            continue
+        if a["type"] == "ac" and not data[next(iter(data))][0]:
+            result.setdefault("failures", []).append("AC analysis returned zero frequency points")
+            continue
+        if a["type"] == "tran" and not data[next(iter(data))][0]:
+            result.setdefault("failures", []).append("transient analysis returned zero time samples")
+            continue
         if a["type"] == "op":
             result["op"] = {net: rows[1][0] if len(rows) > 1 else rows[0][0] for net, rows in data.items()}
         elif a["type"] == "ac" and data:
@@ -316,11 +327,19 @@ def spice(netlist_text: str, commands: list) -> dict:
 def read_raw(path) -> dict:
     """Read an ASCII SPICE raw file: {variable name: [values...]}; complex values are returned as complex."""
     lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
-    i = next(k for k, line in enumerate(lines) if line.startswith("Variables:")) + 1
+    try:
+        i = next(k for k, line in enumerate(lines) if line.startswith("Variables:")) + 1
+    except StopIteration as exc:
+        raise ValueError("SPICE raw file has no Variables section") from exc
     names = []
-    while not lines[i].startswith("Values:"):
-        names.append(lines[i].split("\t")[-1].split()[0] if "\t" in lines[i] else lines[i].split()[1])
+    while i < len(lines) and not lines[i].startswith("Values:"):
+        fields = lines[i].split()
+        if len(fields) < 2:
+            raise ValueError(f"invalid SPICE variable line: {lines[i]!r}")
+        names.append(fields[1])
         i += 1
+    if i >= len(lines) or not names:
+        raise ValueError("SPICE raw file lacks a complete Variables/Values section")
     values = []
     for line in lines[i + 1:]:
         tok = line.split()

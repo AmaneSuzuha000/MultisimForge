@@ -290,8 +290,22 @@ def open_design(ms14: Path):
             f"{len(existing)} Multisim window(s) are already open for a design named {ms14.stem!r} "
             f"(pids {sorted({p for _, p in existing})}). Capture cannot tell which file such a window "
             f"shows, so close it first; capture opens its own copy and closes it afterwards")
+    proc = subprocess.Popen([CONFIG["multisim_exe"], str(ms14)])
+    try:
+        return _wait_for_open_design(ms14, proc)
+    except BaseException:
+        # Only terminate the process we launched, never an existing user instance.
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except OSError:
+            pass
+        raise
+
+
+def _wait_for_open_design(ms14: Path, proc):
+    """Resolve the new window or fail; open_design owns cleanup before handoff."""
     main, pid = None, None
-    subprocess.Popen([CONFIG["multisim_exe"], str(ms14)])
     deadline = time.time() + 120
     while main is None and time.time() < deadline:
         time.sleep(1)

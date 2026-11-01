@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 
 from multisimforge.access import require_write_target, safe_escape_command

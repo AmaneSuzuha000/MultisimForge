@@ -174,7 +174,9 @@ async def runtime_status() -> dict[str, Any]:
     add("samples_dir", Path(cfg.get("samples_dir", "")).is_dir(), cfg.get("samples_dir", ""), required=False)
     add("master_db", Path(cfg.get("master_db", "")).is_file(), cfg.get("master_db", ""), required=False)
     add("node_decoder", Path(cfg.get("node_decoder", "")).is_dir(), cfg.get("node_decoder", ""), required=False)
-    add("python32", Path(cfg.get("python32", "")).is_file(), cfg.get("python32", ""))
+    py32 = str(cfg.get("python32") or "")
+    launcher = py32.startswith(("py ", "py.exe "))
+    add("python32", bool(py32) and (Path(py32).is_file() or (launcher and __import__("shutil").which("py") is not None)), py32)
     add("library_dir", Path(cfg.get("library_dir", "")).is_dir(), cfg.get("library_dir", ""), required=False)
     add("work_dir", Path(cfg.get("work_dir", "")).is_dir(), cfg.get("work_dir", ""), required=False)
 
@@ -190,7 +192,7 @@ async def runtime_status() -> dict[str, Any]:
         deps = {}
         add("capture_deps_error", False, str(exc))
     for name, ok in deps.items():
-        add(f"cli_dep:{name}", ok, "capture/sim dependency", required=(name == "win32com"))
+        add(f"cli_dep:{name}", ok, "64-bit CLI capture dependency; COM is checked in python32_win32com", required=False)
     if cfg.get("python32"):
         try:
             com = subprocess.run(
