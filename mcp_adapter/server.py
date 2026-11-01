@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
+from multisimforge.access import require_write_target, safe_escape_command
 
 ADAPTER_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ADAPTER_DIR / "config.json"
@@ -140,8 +141,15 @@ def _stamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def _assert_write_target(path: Path) -> Path:
+    """MCP defaults to writing only below work/. Widen explicitly through config."""
+    root = Path(os.environ.get("MULTISIMFORGE_MCP_OUTPUT_ROOT", str(WORK_DIR)))
+    return require_write_target(path, root)
+
+
 def _make_output_path(p: str, default_name: str) -> Path:
     target = _resolve(p) if p else (WORK_DIR / "tmp" / default_name)
+    target = _assert_write_target(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     return target
 
@@ -265,7 +273,7 @@ async def capture_instruments(
     panel (XSC scope, XBP bode, ...) and the full screen. Runs the interactive simulation,
     waits for the trace to settle, and auto-adjusts sim time when the scope scan is not
     full-width. Multisim comes to the foreground; do not use the mouse while it runs."""
-    target = _resolve(outdir) if outdir else (WORK_DIR / "captures" / f"{Path(ms14).stem}_{_stamp()}")
+    target = _assert_write_target(_resolve(outdir) if outdir else (WORK_DIR / "captures" / f"{Path(ms14).stem}_{_stamp()}"))
     target.mkdir(parents=True, exist_ok=True)
     args = ["capture", str(_resolve(ms14)), str(target), "--wait", str(wait_s),
             "--timeout", str(timeout_s)]
@@ -320,20 +328,22 @@ async def preview_design(ms14: str, png: str = "") -> dict[str, Any]:
 
 @mcp.tool()
 async def set_sim_time(ms14: str, seconds: str) -> dict[str, Any]:
-    """Set the interactive simulation end time stored in a .ms14 (e.g. '20ms')."""
-    return await asyncio.to_thread(_run_cli, ["set-sim-time", str(_resolve(ms14)), seconds])
+    """Edit an editable work/ copy; external in-place writes are denied by default."""
+    target = _assert_write_target(_resolve(ms14))
+    return await asyncio.to_thread(_run_cli, ["set-sim-time", str(target), seconds])
 
 
 @mcp.tool()
 async def convert_design(src: str, dst: str = "", direction: Literal["decode", "encode"] = "decode") -> dict[str, Any]:
-    """Convert .ms14 -> XML (decode) or XML -> .ms14 (encode). Defaults write beside the source."""
+    """Convert .ms14 to XML or back. Default output is under work/tmp."""
     src_p = _resolve(src)
     if dst:
         dst_p = _resolve(dst)
     elif direction == "decode":
-        dst_p = src_p.with_suffix(src_p.suffix + ".xml")
+        dst_p = WORK_DIR / "tmp" / (src_p.name + ".xml")
     else:
-        dst_p = src_p.with_name(src_p.stem + "_rebuilt.ms14")
+        dst_p = WORK_DIR / "tmp" / (src_p.stem + "_rebuilt.ms14")
+    dst_p = _assert_write_target(dst_p)
     dst_p.parent.mkdir(parents=True, exist_ok=True)
     return await asyncio.to_thread(_run_cli, [direction, str(src_p), str(dst_p)])
 
@@ -344,6 +354,8 @@ async def parts(action: Literal["list", "show", "harvest", "fetch", "init", "dbi
     """Component template library: list/search, show pin geometry, harvest from an existing
     .ms14 (offline), fetch a part from the Multisim database (COM + Node decoder), init from
     official samples (COM), or build the database index."""
+    if action not in ("list", "show") and os.environ.get("MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES") != "1":
+        raise PermissionError("MCP part-library mutations are disabled; set MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES=1 to enable them")
     args = ["parts", action]
     if arg:
         args.append(str(_resolve(arg)) if action == "harvest" else arg)
@@ -358,9 +370,8 @@ async def parts(action: Literal["list", "show", "harvest", "fetch", "init", "dbi
 
 @mcp.tool()
 async def run_cli(argv: list[str], timeout_s: float = 300) -> dict[str, Any]:
-    """Escape hatch: run an arbitrary multisimforge subcommand (JSON args only), e.g.
-    ['decode','a.ms14','a.xml'] or ['sim','a.ms14','--tran','10m','--csv','out']. Prefer the
-    typed tools; use this only for commands without a wrapper."""
+    """Read-only escape hatch for check, inspect and numerical cursors.
+    Use typed tools for simulation and writes so output policies are enforced."""
     args = [str(a) for a in argv]
     blocked = _blocked(args)
     if blocked:
@@ -368,20 +379,8 @@ async def run_cli(argv: list[str], timeout_s: float = 300) -> dict[str, Any]:
     return await asyncio.to_thread(_run_cli, args, timeout_s)
 
 
-DESTRUCTIVE = {
-    "com": "stopping the COM session drops the Multisim instance other tools are using",
-    "parts": "parts can overwrite the part library",
-}
-
-
 def _blocked(args: list[str]) -> str:
-    """Refuse the few subcommands that can destroy state outside the workspace."""
-    if not args:
-        return "no subcommand given"
-    if args[0] in DESTRUCTIVE:
-        return (f"'run_cli {args[0]}' is not allowed: {DESTRUCTIVE[args[0]]}. "
-                f"Use the typed tools, or run it yourself in a terminal.")
-    return ""
+    return safe_escape_command(args)
 
 
 def main() -> None:
