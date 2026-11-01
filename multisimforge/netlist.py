@@ -111,8 +111,10 @@ def _source(rest: str, refdes: str) -> dict:
     m = re.search(r"(?i)\bsin\s*\(([^)]*)\)", text)
     if m:
         args = [parse_value(a) for a in m.group(1).replace(",", " ").split()]
-        if not 3 <= len(args) <= 6:
-            raise ValueError(f"{refdes}: SIN needs 3 to 6 values (offset peak frequency [delay damping phase])")
+        if len(args) < 3:
+            raise ValueError(f"{refdes}: SIN needs at least (offset peak frequency)")
+        if len(args) > 6:
+            raise ValueError(f"{refdes}: SIN accepts at most 6 parameters (offset peak frequency [delay damping phase])")
         out.update(type="sin", offset=args[0], amplitude=args[1], freq=args[2],
                    delay=args[3] if len(args) > 3 else 0.0, damping=args[4] if len(args) > 4 else 0.0,
                    phase=args[5] if len(args) > 5 else 0.0)
