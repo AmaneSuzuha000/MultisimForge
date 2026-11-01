@@ -77,19 +77,26 @@ def grab(hwnd: int) -> Image.Image:
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
     w, h = right - left, bottom - top
     hdc = win32gui.GetWindowDC(hwnd)
-    src = win32ui.CreateDCFromHandle(hdc)
-    mem = src.CreateCompatibleDC()
-    bmp = win32ui.CreateBitmap()
-    bmp.CreateCompatibleBitmap(src, w, h)
-    mem.SelectObject(bmp)
-    user32.PrintWindow(hwnd, mem.GetSafeHdc(), 2)     # PW_RENDERFULLCONTENT: renders fully even when occluded
-    info = bmp.GetInfo()
-    img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), bmp.GetBitmapBits(True), "raw", "BGRX", 0, 1)
-    win32gui.DeleteObject(bmp.GetHandle())
-    mem.DeleteDC()
-    src.DeleteDC()
-    win32gui.ReleaseDC(hwnd, hdc)
-    return img.copy()
+    src = mem = bmp = None
+    try:
+        src = win32ui.CreateDCFromHandle(hdc)
+        mem = src.CreateCompatibleDC()
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(src, w, h)
+        mem.SelectObject(bmp)
+        if not user32.PrintWindow(hwnd, mem.GetSafeHdc(), 2):
+            raise RuntimeError(f"PrintWindow returned failure for window {hwnd}; refusing to save a blank screenshot")
+        info = bmp.GetInfo()
+        img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), bmp.GetBitmapBits(True), "raw", "BGRX", 0, 1)
+        return img.copy()
+    finally:
+        if bmp is not None:
+            win32gui.DeleteObject(bmp.GetHandle())
+        if mem is not None:
+            mem.DeleteDC()
+        if src is not None:
+            src.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hdc)
 
 
 def bring_to_front(hwnd: int) -> bool:
