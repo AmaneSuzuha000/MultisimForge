@@ -177,6 +177,13 @@ def sim_status(payload: dict, require_vectors: bool = False):
     return Status.WARN if payload.get("warnings") else Status.PASS
 
 
+def cmd_cursors(a):
+    """Numerical cursor readouts from original simulator CSV (not Multisim GUI cursors)."""
+    from .measure import measure_csv
+    from .netlist import parse_value
+    return measure_csv(a.csv, a.column, parse_value(a.x1), parse_value(a.x2), axis=a.axis), Status.PASS
+
+
 def cmd_capture(a):
     from . import capture
     r = capture.capture(a.ms14, a.outdir, wait=a.wait, timeout=a.timeout, keep_open=a.keep_open,
@@ -262,7 +269,15 @@ def main(argv=None):
     s.add_argument("--cmd", action="append", required=True, help='analysis command, e.g. "tran 1u 10m"; may be repeated')
     s.set_defaults(func=cmd_spice)
 
-    s = sub.add_parser("capture", help="open Multisim, run the simulation, and capture the circuit, instrument panels, and full screen")
+    s = sub.add_parser("cursors", help="virtual numerical cursors measured from simulator CSV; no GUI cursor preset")
+    s.add_argument("csv", help="AC or transient CSV exported by sim")
+    s.add_argument("--column", required=True, help="data column to measure, e.g. vout or vout_mag")
+    s.add_argument("--x1", required=True, help="first cursor x-coordinate, supports units")
+    s.add_argument("--x2", required=True, help="second cursor x-coordinate, supports units")
+    s.add_argument("--axis", choices=["auto", "linear", "log"], default="auto")
+    s.set_defaults(func=cmd_cursors)
+
+    s = sub.add_parser("capture", help="open Multisim, run the simulation, and capture the circuit and instrument panels")
     s.add_argument("ms14")
     s.add_argument("outdir")
     s.add_argument("--wait", type=_positive, default=1.5, help="how long the display must be still to consider the simulation finished (seconds)")
