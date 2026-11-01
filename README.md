@@ -238,7 +238,7 @@ in frequency); phase columns are unwrapped first. Returned results carry
 
 `capture` now saves an explicitly labelled `*_montage.png` contact sheet
 assembled from real `PrintWindow` bitmaps plus each original instrument image.
-It works without taking foreground, and is **not a desktop screenshot**. If a
+It needs no explicit foreground-grab step, and is **not a desktop screenshot**. Launching Multisim itself may still activate its window on some Windows desktops. If a
 genuine desktop view is needed, opt in with `capture ... --desktop-screen`; that
 specific option still requires foreground and should be run unattended.
 

@@ -210,6 +210,8 @@ def _oneshot(job: dict, timeout: float) -> dict:
             result = json.loads(lines[-1])
         except json.JSONDecodeError:
             pass
+    if proc is not None and proc.returncode != 0 and result is not None:
+        result = {"error": f"worker exited {proc.returncode} despite a JSON reply"}
     if result is None or result.get("error"):
         for pid in _multisim_pids() - before:      # if the process dies abnormally, the Multisim instance it started is not closed automatically
             subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True)
