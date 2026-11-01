@@ -31,6 +31,10 @@ class JobTimeout(ComError):
     """The daemon accepted the job but did not answer in time; the work may still be running."""
 
 
+class JobIndeterminate(ComError):
+    """The request may have reached Multisim. Never replay it automatically."""
+
+
 # ---------------------------------------------------------------------------
 # Client side (any Python)
 # ---------------------------------------------------------------------------
@@ -80,10 +84,10 @@ def _request(job: dict, timeout: float) -> dict:
     if state:
         try:
             return _roundtrip(state, job, timeout)
-        except JobTimeout:
-            raise                                   # accepted but slow: never replay it
-        except (OSError, ValueError, ComError):
-            pass                                    # daemon has exited; restart it
+        except ComError:
+            raise                                   # accepted or rejected: never replay
+        except (OSError, ValueError):
+            pass                                    # connect failed: safe to restart
     proc = Popen(                                    # module-level alias: patchable without touching subprocess
         [*python32_argv(), "-X", "utf8", "-m", "multisimforge.com", "--serve"],
         cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -106,15 +110,14 @@ def _request(job: dict, timeout: float) -> dict:
 
 def _roundtrip(state: dict, job: dict, timeout: float) -> dict:
     payload = dict(job, token=state.get("token"))
-    sent = False
+    submitted = False
     try:
-        # Only the TCP connect gets the short probe timeout; once connected, the job
-        # itself may legitimately run for the caller's full timeout.
+        # Once sending starts, a partial write may already have reached the worker.
         with socket.create_connection(("127.0.0.1", int(state["port"])),
                                       timeout=min(timeout, CONNECT_TIMEOUT)) as sock:
-            sock.settimeout(timeout)                    # honour the caller's budget exactly
+            sock.settimeout(timeout)
+            submitted = True
             sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-            sent = True
             chunks = []
             while True:
                 block = sock.recv(65536)
@@ -124,17 +127,25 @@ def _roundtrip(state: dict, job: dict, timeout: float) -> dict:
                 if block.endswith(b"\n"):
                     break
     except socket.timeout as exc:
-        if sent:
-            raise JobTimeout(str(exc)) from None
+        if submitted:
+            raise JobTimeout(str(exc)) from exc
+        raise
+    except OSError as exc:
+        if submitted:
+            raise JobIndeterminate(f"COM connection lost after request submission: {exc}") from exc
         raise
     text = b"".join(chunks).decode("utf-8", "replace").strip()
     if not text:
-        raise ValueError("daemon returned no result")
-    result = json.loads(text)
+        raise JobIndeterminate("COM daemon closed without a result after request submission")
+    try:
+        result = json.loads(text)
+    except ValueError as exc:
+        raise JobIndeterminate("COM daemon returned malformed JSON after request submission") from exc
+    if not isinstance(result, dict):
+        raise JobIndeterminate("COM daemon returned non-object JSON after request submission")
     if result.get("error"):
-        raise ComError(result["error"])
+        raise ComError(result["error"])       # completed with error; not retryable
     return result
-
 
 def call(job: dict, timeout: float = 300) -> dict:
     """Run one COM job. Reuses the background daemon when possible and falls back to a one-shot subprocess on failure.
@@ -148,7 +159,9 @@ def call(job: dict, timeout: float = 300) -> dict:
     except JobTimeout as exc:
         raise ComError(f"Multisim COM job {job.get('op')} timed out after {timeout:g}s; it may still be running, "
                        f"so it was not retried ({exc})") from None
-    except (ComError, OSError, ValueError):
+    except ComError:
+        raise                                # worker answered, or submission is uncertain
+    except (OSError, ValueError):
         return _oneshot(job, timeout)
 
 

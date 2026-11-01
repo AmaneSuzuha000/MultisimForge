@@ -81,8 +81,10 @@ for _i in range(16):
 _LIT_TOKEN = [(CH_CODE_ASC[b] << 1, CH_BITS_ASC[b] + 1) for b in range(256)]
 
 
-def explode(block: bytes) -> bytes:
-    """Decompress one DCL Implode data block."""
+def explode(block: bytes, *, max_output: int | None = None) -> bytes:
+    """Decompress one DCL Implode block, bounding actual output as it expands."""
+    if len(block) < 2:
+        raise ValueError("Corrupt compressed data: missing DCL header")
     ascii_lit, dict_bits = block[0], block[1]
     if ascii_lit > 1 or not 4 <= dict_bits <= 6:
         raise ValueError("Not DCL Implode data")
@@ -90,8 +92,12 @@ def explode(block: bytes) -> bytes:
     out = bytearray()
     pos = 0
     while True:
+        if pos >= (len(block) - 2) * 8:
+            raise ValueError("Corrupt compressed data: missing end marker")
         v = int.from_bytes(buf[pos >> 3:(pos >> 3) + 4], "little") >> (pos & 7)
         if not v & 1:                                   # literal
+            if max_output is not None and len(out) >= max_output:
+                raise ValueError("Decompressed data exceeds declared section length")
             if ascii_lit:
                 sym, n = _LIT[(v >> 1) & 0x1FFF]
                 out.append(sym)
@@ -106,6 +112,10 @@ def explode(block: bytes) -> bytes:
         pos += 1 + n + e
         if length == 519:
             break
+        if max_output is not None and len(out) + length > max_output:
+            raise ValueError("Decompressed data exceeds declared section length")
+        if pos >= (len(block) - 2) * 8:
+            raise ValueError("Corrupt compressed data: truncated back-reference")
         v = int.from_bytes(buf[pos >> 3:(pos >> 3) + 4], "little") >> (pos & 7)
         hi, n = _DIST[v & 0xFF]
         low_bits = 2 if length == 2 else dict_bits
@@ -204,11 +214,11 @@ def decode(data: bytes, *, max_bytes: int = MAX_FILE, max_section: int = MAX_SEC
             raise ValueError("corrupt .ms14: a section header is truncated")
         raw_len, comp_len = struct.unpack_from("<II", data, pos)
         pos += 8
-        if raw_len > max_section:
-            raise ValueError(f"corrupt or oversized .ms14: a section declares {raw_len} bytes, the limit is {max_section}")
+        if raw_len == 0 or raw_len > max_section or size + raw_len > total:
+            raise ValueError(f"corrupt or oversized .ms14: invalid section length {raw_len} (limit {max_section}, remaining {total-size})")
         if comp_len > len(data) - pos:
             raise ValueError("corrupt .ms14: a section is longer than the file")
-        part = explode(data[pos:pos + comp_len])
+        part = explode(data[pos:pos + comp_len], max_output=raw_len)
         if len(part) != raw_len:
             raise ValueError(f"Section length mismatch: expected {raw_len}, got {len(part)}")
         parts.append(part)
