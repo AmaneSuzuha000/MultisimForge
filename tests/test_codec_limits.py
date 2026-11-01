@@ -47,3 +47,26 @@ def test_oversized_section(good):
 def test_limit_is_configurable(good):
     with pytest.raises(ValueError, match="limit"):
         codec.decode(good, max_bytes=10)
+
+
+def test_actual_inflation_cannot_exceed_declared_section(good):
+    blob = good[:44] + struct.pack("<II", 1, len(good) - 52) + good[52:]
+    with pytest.raises(ValueError, match="exceeds declared section"):
+        codec.decode(blob)
+
+
+def test_short_dcl_header():
+    with pytest.raises(ValueError, match="DCL header"):
+        codec.explode(b"")
+
+
+def test_damaged_dcl_blocks_fail_cleanly_with_bounded_output():
+    import random
+    for seed in range(48):
+        rng = random.Random(seed)
+        block = bytes((1, 6)) + rng.randbytes(24)
+        try:
+            out = codec.explode(block, max_output=100)
+        except ValueError:
+            continue
+        assert len(out) <= 100

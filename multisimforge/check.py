@@ -114,10 +114,11 @@ class Circuit:
         out = []
         for key, it in self.wires.items():
             ends = (it[0].get("Connect1"), it[0].get("Connect2"))
-            if not any(end in attached for end in ends):
+            invalid = [i for i, end in enumerate(ends, 1) if end not in attached]
+            if invalid:
                 points = it[0].find("Points")
                 pts = [(p.get("X"), p.get("Y")) for p in (points if points is not None else [])]
-                out.append((key, pts[0] if pts else ("?", "?")))
+                out.append((key, pts[0] if pts else ("?", "?"), invalid))
         return out
 
     def graphic_groups(self):
@@ -160,8 +161,11 @@ def check_file(path, expected: dict | None = None) -> dict:
     for name, count in sorted(c.refdes_counts().items()):
         if count > 1:
             problems.append(f"Reference designator {name} is used by {count} components; every component needs a unique one")
-    for key, point in c.dangling_wires():
-        problems.append(f"Wire {key} at {point[0]},{point[1]} is not attached to anything")
+    for key, point, invalid in c.dangling_wires():
+        if len(invalid) == 2:
+            problems.append(f"Wire {key} at {point[0]},{point[1]} is not attached to anything")
+        else:
+            problems.append(f"Wire {key} at {point[0]},{point[1]} has an unattached endpoint {invalid[0]}")
     nets = c.electrical_nets()
     port_net = {m: net for net, members in nets.items() for m in members}
     groups = c.graphic_groups()

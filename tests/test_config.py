@@ -35,7 +35,12 @@ def test_python32_argv_splits_a_launcher_command(monkeypatch):
 
 def test_python32_honours_the_environment_override(monkeypatch, tmp_path):
     monkeypatch.setenv("MULTISIMFORGE_PYTHON32", r"D:\custom\python.exe")
-    assert config._detect_python32() == r"D:\custom\python.exe"
+    # Detection is Windows-specific, but the resolved CONFIG honours overrides on all platforms.
+    if sys.platform == "win32":
+        assert config._detect_python32() == r"D:\custom\python.exe"
+    else:
+        assert config._detect_python32() == sys.executable
+    assert config._load()["python32"] == r"D:\custom\python.exe"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the 32-bit rule is Windows-only")

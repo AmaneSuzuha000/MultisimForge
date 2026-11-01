@@ -66,3 +66,24 @@ def test_transient_period_from_zero_crossings():
 def test_transient_without_enough_crossings_reports_no_period():
     flat = sim.tran_summary([0, 1, 2], [1.0, 1.0, 1.0])
     assert flat["period"] is None and flat["freq"] is None
+
+
+def test_empty_simulator_ac_vector_is_a_failure(monkeypatch, tmp_path):
+    from multisimforge import cli
+    monkeypatch.setattr(sim.xmlio, "load", lambda path: object())
+    monkeypatch.setattr(sim.xmlio, "save", lambda *args: None)
+    monkeypatch.setattr(sim, "add_probes", lambda *args: {"vout": "probe1"})
+    monkeypatch.setattr(sim.com, "call", lambda job: {"results": [{
+        "type": "ac", "missing": [], "data": {"probe1": [[], [], []]},
+    }]})
+    monkeypatch.setitem(sim.CONFIG, "work_dir", str(tmp_path))
+    result = sim.run(str(tmp_path / "test.ms14"), ["vout"], ac=(10, 100, 10))
+    assert result["failures"]
+    assert cli.sim_status(result).value == "FAIL"
+
+
+def test_truncated_spice_raw_file_reports_value_error(tmp_path):
+    p = tmp_path / "empty.raw"
+    p.write_text("Title: unfinished\nVariables:\n0 time time\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="complete Variables"):
+        sim.read_raw(p)

@@ -189,7 +189,11 @@ def ac_summary(freq, h, at=()):
         raise ValueError("the AC sweep produced no points; check the sweep range and that the simulation ran")
     if len(freq) != len(h):
         raise ValueError(f"the AC sweep returned {len(freq)} frequencies but {len(h)} values")
+    if any(not math.isfinite(f) or f <= 0 for f in freq) or any(b <= a for a, b in zip(freq, freq[1:])):
+        raise ValueError("AC frequencies must be finite, positive and strictly increasing")
     mag = [abs(v) for v in h]
+    if any(not math.isfinite(v) for v in mag):
+        raise ValueError("AC values contain non-finite magnitudes")
     phase = _unwrap([math.degrees(cmath.phase(v)) for v in h])
     k = max(range(len(mag)), key=mag.__getitem__)
     level = mag[k] / math.sqrt(2)
@@ -201,6 +205,8 @@ def ac_summary(freq, h, at=()):
             cutoffs.append(fc)
 
     def point(x):
+        if not math.isfinite(x) or x < freq[0] or x > freq[-1]:
+            raise ValueError(f"AC requested frequency {x:g} is outside measured sweep [{freq[0]:g}, {freq[-1]:g}]")
         g = _interp_log(freq, mag, x)
         return {"f": x, "gain": g, "dB": 20 * math.log10(g) if g > 0 else None, "phase_deg": _interp_log(freq, phase, x)}
 
@@ -216,7 +222,9 @@ def tran_summary(t, v):
     n = len(v)
     mean = sum(v) / n
     rms = math.sqrt(sum(x * x for x in v) / n)
-    crossings = [t[i] for i in range(n - 1) if (v[i] - mean) < 0 <= (v[i + 1] - mean)]
+    # Interpolate each rising crossing to remove sampling-grid bias.
+    crossings = [t[i] + ((mean - v[i]) / (v[i + 1] - v[i])) * (t[i + 1] - t[i])
+                 for i in range(n - 1) if (v[i] - mean) < 0 <= (v[i + 1] - mean)]
     period = (crossings[-1] - crossings[0]) / (len(crossings) - 1) if len(crossings) > 2 else None
     return {"max": max(v), "min": min(v), "pp": max(v) - min(v), "mean": mean, "rms": rms,
             "period": period, "freq": 1 / period if period else None}
@@ -250,13 +258,24 @@ def run(ms14: str, nets: list, op=False, ac=None, tran=None, ac_out=None, ac_in=
     raw = com.call({"op": "analyze", "ms14": str(probe_file), "analyses": analyses})
     by_output = {v: k for k, v in outputs.items()}
     result = {"outputs": outputs}
-    for a in raw["results"]:
+    if not raw.get("results"):
+        result.setdefault("failures", []).append("simulator returned no analysis results")
+    for a in raw.get("results", []):
         if a["missing"]:
             result.setdefault("missing", []).extend(a["missing"])
             result.setdefault("failures", []).append(
                 f"{a['type']} analysis did not return {', '.join(a['missing'])}: {a['last_error']}")
             result.setdefault("warnings", []).append(f"{a['type']} analysis did not return {a['missing']}: {a['last_error']}")
         data = {by_output[k]: rows for k, rows in a["data"].items()}
+        if not data:
+            result.setdefault("failures", []).append(f"{a['type']} analysis returned no measured vectors")
+            continue
+        if a["type"] == "ac" and not data[next(iter(data))][0]:
+            result.setdefault("failures", []).append("AC analysis returned zero frequency points")
+            continue
+        if a["type"] == "tran" and not data[next(iter(data))][0]:
+            result.setdefault("failures", []).append("transient analysis returned zero time samples")
+            continue
         if a["type"] == "op":
             result["op"] = {net: rows[1][0] if len(rows) > 1 else rows[0][0] for net, rows in data.items()}
         elif a["type"] == "ac" and data:
@@ -316,11 +335,19 @@ def spice(netlist_text: str, commands: list) -> dict:
 def read_raw(path) -> dict:
     """Read an ASCII SPICE raw file: {variable name: [values...]}; complex values are returned as complex."""
     lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
-    i = next(k for k, line in enumerate(lines) if line.startswith("Variables:")) + 1
+    try:
+        i = next(k for k, line in enumerate(lines) if line.startswith("Variables:")) + 1
+    except StopIteration as exc:
+        raise ValueError("SPICE raw file has no Variables section") from exc
     names = []
-    while not lines[i].startswith("Values:"):
-        names.append(lines[i].split("\t")[-1].split()[0] if "\t" in lines[i] else lines[i].split()[1])
+    while i < len(lines) and not lines[i].startswith("Values:"):
+        fields = lines[i].split()
+        if len(fields) < 2:
+            raise ValueError(f"invalid SPICE variable line: {lines[i]!r}")
+        names.append(fields[1])
         i += 1
+    if i >= len(lines) or not names:
+        raise ValueError("SPICE raw file lacks a complete Variables/Values section")
     values = []
     for line in lines[i + 1:]:
         tok = line.split()

@@ -1007,6 +1007,12 @@ def _build_once(spec: dict, lib: Library, allow_fallback: bool, out=None) -> dic
             raise KeyError(f"{inst.refdes}: part {inst.part!r} is not in the part library (search with 'multisimforge parts list', "
                            f"fetch it from the Multisim database with 'multisimforge parts fetch {inst.part}')")
         info = lib.index[key]
+        if int(info.get("sections") or 1) > 1:
+            b.warnings.append(
+                f"{inst.refdes} ({key}) has {info['sections']} physical sections; "
+                "this template places section A only. Separate instances are NOT "
+                "automatically linked to the same IC package."
+            )
         refdes = inst.refdes
         if refdes[0] in "Xx" and info["kind"] != "instrument" and len(refdes) > 1 and refdes[1].isalpha():
             refdes = refdes[1:]                      # XU1 -> U1 (Multisim naming convention)

@@ -14,6 +14,7 @@ Supported lines:
 Comments start with *, .end and other dot commands are ignored; a line starting with + continues the previous one.
 Net names are case-insensitive; 0 and gnd are both ground.
 """
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -46,7 +47,10 @@ def parse_value(token) -> float:
      typo such as 1kgarbage or 4.7kjunk is rejected instead of silently becoming 1k.
     """
     if isinstance(token, (int, float)):
-        return float(token)
+        value = float(token)
+        if not math.isfinite(value):
+            raise ValueError(f"cannot parse non-finite value {token!r}")
+        return value
     text = str(token).strip()
     m = _RKM.match(text)
     if m:
@@ -54,14 +58,20 @@ def parse_value(token) -> float:
         if unit.lower() not in _UNITS:
             raise ValueError(f"cannot parse value {token!r}")
         scale = 1e6 if mult == "M" else SUFFIX[mult.lower()]
-        return float(f"{whole}.{frac}") * scale
+        value = float(f"{whole}.{frac}") * scale
+        if not math.isfinite(value):
+            raise ValueError(f"cannot parse non-finite value {token!r}")
+        return value
     m = _NUM.match(text)
     if not m:
         raise ValueError(f"cannot parse value {token!r}")
     number, mult, unit = m.group(1), m.group(2) or "", m.group(3)
     if unit.lower() not in _UNITS:
         raise ValueError(f"cannot parse value {token!r}")
-    return float(number) * (1e6 if mult == "M" else SUFFIX[mult.lower()])
+    value = float(number) * (1e6 if mult == "M" else SUFFIX[mult.lower()])
+    if not math.isfinite(value):
+        raise ValueError(f"cannot parse non-finite value {token!r}")
+    return value
 
 
 def net_name(token: str) -> str:
@@ -103,6 +113,8 @@ def _source(rest: str, refdes: str) -> dict:
         args = [parse_value(a) for a in m.group(1).replace(",", " ").split()]
         if len(args) < 3:
             raise ValueError(f"{refdes}: SIN needs at least (offset peak frequency)")
+        if len(args) > 6:
+            raise ValueError(f"{refdes}: SIN accepts at most 6 parameters (offset peak frequency [delay damping phase])")
         out.update(type="sin", offset=args[0], amplitude=args[1], freq=args[2],
                    delay=args[3] if len(args) > 3 else 0.0, damping=args[4] if len(args) > 4 else 0.0,
                    phase=args[5] if len(args) > 5 else 0.0)
@@ -165,9 +177,13 @@ def parse(text: str) -> list[Instance]:
             inst.nets = [net_name(t) for t in tokens[1:3]]
             inst.value = tokens[3]
             parse_value(inst.value)
+            if len(tokens) > 5:
+                raise ValueError(f"{ref}: unexpected trailing tokens after explicit part name")
             if len(tokens) > 4:
                 inst.part = tokens[4]          # explicit library part, e.g. an electrolytic capacitor
         elif key[0] in "VI":
+            if len(tokens) < 4:
+                raise ValueError(f"{ref}: write {ref} node1 node2 source")
             inst.nets = [net_name(t) for t in tokens[1:3]]
             inst.source = _source(" ".join(tokens[3:]), ref)
             kind = inst.source["type"]

@@ -73,3 +73,12 @@ def test_xml_without_diagram(tmp_path):
     bad.write_text('<?xml version="1.0"?><Root><A/></Root>', encoding="utf-8")
     with pytest.raises(ValueError, match="no CIITDiagram"):
         check.check_file(bad)
+
+
+@pytest.mark.needs_parts
+def test_single_unattached_endpoint(clean, tmp_path):
+    def edit(root):
+        wire = next(it for it in root.iter("Item") if it.get("Class") == "CIITLinkComp")
+        wire[0].set("Connect2", "not_a_connector")
+    report = check.check_file(_rewrite(clean, tmp_path, edit))
+    assert any("unattached endpoint 2" in p for p in report["problems"])

@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - reliability and known-limitation mitigations
+
+- Fixed two unsafe COM replay paths, including daemon business errors and transport
+  disconnects after submission; requests with uncertain outcome are not retried.
+- Offline checker now identifies wires with only one unattached endpoint.
+- DCL decoder enforces the *actual* expanding output limit, not just header lengths.
+- Corrected cross-platform Python32 configuration test in CI.
+- Added measured numerical CSV cursors for transient and AC waveforms; these are
+  explicitly distinct from unsupported NI GUI cursor presets.
+- Added foreground-free PrintWindow montage and opt-in desktop capture, plus
+  GUI exception cleanup. Composite images are clearly labelled.
+- Scoped MCP output writes and denied mutating run_cli/library actions by default.
+- Warn on section-A-only use of multi-section part templates.
+
 ## [0.1.6] - 2026-10-31
 
 Tests for the two modules that touch the operating system: the screenshot helpers and
