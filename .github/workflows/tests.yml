@@ -32,7 +32,8 @@ jobs:
       # Building a circuit needs a part library harvested from a licensed
       # Multisim installation, which a public runner does not have.
       # Those tests carry the needs_parts marker and skip here.
-      - run: python -m pytest -q -m "not needs_parts"
+      - run: python -m pytest -q
+      - run: python scripts/verify.py --real -m "not needs_parts"
       - run: python -m pytest -q -m needs_parts
         continue-on-error: true
 

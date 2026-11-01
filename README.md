@@ -252,6 +252,15 @@ Mutating part-library actions require the explicit
 `MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES=1` environment setting. The direct
 local CLI remains available for trusted manual maintenance.
 
+## Native acceptance
+
+The public CI matrix is offline and does not contain licensed Multisim. On an
+authorised Windows worker with an interactive desktop, run
+`python scripts/verify.py --real`. Native acceptance now checks real AC data,
+the COM worker, live circuit/instrument images, the PrintWindow montage, and
+the preservation of the original circuit file's SHA-256. The manually triggered
+`native` GitHub job runs the same gate. A skipped native job is **not** a pass.
+
 ## Known limitations
 
 - **Multisim 14.3 does not restore GUI cursor positions.** Numerical CSV cursor
