@@ -99,14 +99,20 @@ def explode(block: bytes, *, max_output: int | None = None) -> bytes:
             if max_output is not None and len(out) >= max_output:
                 raise ValueError("Decompressed data exceeds declared section length")
             if ascii_lit:
-                sym, n = _LIT[(v >> 1) & 0x1FFF]
+                entry = _LIT[(v >> 1) & 0x1FFF]
+                if entry is None:
+                    raise ValueError("Corrupt compressed data: invalid literal code")
+                sym, n = entry
                 out.append(sym)
                 pos += 1 + n
             else:
                 out.append((v >> 1) & 0xFF)
                 pos += 9
             continue
-        i, n = _LEN[(v >> 1) & 0x7F]
+        entry = _LEN[(v >> 1) & 0x7F]
+        if entry is None:
+            raise ValueError("Corrupt compressed data: invalid length code")
+        i, n = entry
         e = EX_LEN_BITS[i]
         length = LEN_BASE[i] + ((v >> (1 + n)) & ((1 << e) - 1)) + 2
         pos += 1 + n + e
@@ -117,7 +123,10 @@ def explode(block: bytes, *, max_output: int | None = None) -> bytes:
         if pos >= (len(block) - 2) * 8:
             raise ValueError("Corrupt compressed data: truncated back-reference")
         v = int.from_bytes(buf[pos >> 3:(pos >> 3) + 4], "little") >> (pos & 7)
-        hi, n = _DIST[v & 0xFF]
+        entry = _DIST[v & 0xFF]
+        if entry is None:
+            raise ValueError("Corrupt compressed data: invalid distance code")
+        hi, n = entry
         low_bits = 2 if length == 2 else dict_bits
         dist = ((hi << low_bits) | ((v >> n) & ((1 << low_bits) - 1))) + 1
         pos += n + low_bits

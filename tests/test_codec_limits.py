@@ -58,3 +58,15 @@ def test_actual_inflation_cannot_exceed_declared_section(good):
 def test_short_dcl_header():
     with pytest.raises(ValueError, match="DCL header"):
         codec.explode(b"")
+
+
+def test_damaged_dcl_blocks_fail_cleanly_with_bounded_output():
+    import random
+    for seed in range(48):
+        rng = random.Random(seed)
+        block = bytes((1, 6)) + rng.randbytes(24)
+        try:
+            out = codec.explode(block, max_output=100)
+        except ValueError:
+            continue
+        assert len(out) <= 100
