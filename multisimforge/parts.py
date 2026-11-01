@@ -354,6 +354,7 @@ def _replace_with_restart(carrier, ref, group, family, name, out, tried):
         if "3221226356" not in str(exc) and "0xc0000374" not in str(exc).lower():
             raise
     com.stop()                                        # drop the instance that Multisim corrupted
+    out.unlink(missing_ok=True)                        # never accept a partial file from a crashed replacement
     tried.append(f"{ref}: Multisim crashed (0xC0000374) inside ReplaceComponent; restarted the instance and retried")
     return com.call(job, timeout=180)
 
@@ -364,7 +365,10 @@ def fetch(name: str, lib: Library, group=None, family=None) -> dict:
         return {"name": lib.resolve(name), "already": True}
     if not (group and family):
         group, family = db_lookup(lib, name)
-    work = Path(CONFIG["work_dir"]) / "fetch"
+    from .result import new_run_id
+    # The old shared fetch/ directory could preserve stale replacement outputs.
+    # Every attempt gets a fresh work directory with no pre-existing model file.
+    work = Path(CONFIG["work_dir"]) / "fetch" / new_run_id()
     work.mkdir(parents=True, exist_ok=True)
     # ReplaceComponent can crash the Multisim process outright (0xC0000374, heap corruption).
     # It does so intermittently and depends on the state of the running instance, not on the
@@ -376,11 +380,15 @@ def fetch(name: str, lib: Library, group=None, family=None) -> dict:
     for ref, line in CARRIERS:
         carrier = work / f"carrier_{ref}.ms14"
         builder.build({"netlist": line, "output": str(carrier), "layout": {ref: [300, 300]}}, lib)
-        out = work / f"{safe_name(name)}.ms14"
+        out = work / f"{safe_name(name)}_{safe_name(ref)}.ms14"
+        out.unlink(missing_ok=True)
         try:
             _replace_with_restart(carrier, ref, group, family, name, out, tried)
         except com.ComError as exc:
             tried.append(f"{ref}: {exc}")
+            continue
+        if not out.is_file():
+            tried.append(f"{ref}: ReplaceComponent returned but wrote no output file")
             continue
         root = xmlio.load(out)
         h = Harvester(root, f"Multisim database {group}/{family}")
