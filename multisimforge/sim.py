@@ -189,7 +189,11 @@ def ac_summary(freq, h, at=()):
         raise ValueError("the AC sweep produced no points; check the sweep range and that the simulation ran")
     if len(freq) != len(h):
         raise ValueError(f"the AC sweep returned {len(freq)} frequencies but {len(h)} values")
+    if any(not math.isfinite(f) or f <= 0 for f in freq) or any(b <= a for a, b in zip(freq, freq[1:])):
+        raise ValueError("AC frequencies must be finite, positive and strictly increasing")
     mag = [abs(v) for v in h]
+    if any(not math.isfinite(v) for v in mag):
+        raise ValueError("AC values contain non-finite magnitudes")
     phase = _unwrap([math.degrees(cmath.phase(v)) for v in h])
     k = max(range(len(mag)), key=mag.__getitem__)
     level = mag[k] / math.sqrt(2)
@@ -201,6 +205,8 @@ def ac_summary(freq, h, at=()):
             cutoffs.append(fc)
 
     def point(x):
+        if not math.isfinite(x) or x < freq[0] or x > freq[-1]:
+            raise ValueError(f"AC requested frequency {x:g} is outside measured sweep [{freq[0]:g}, {freq[-1]:g}]")
         g = _interp_log(freq, mag, x)
         return {"f": x, "gain": g, "dB": 20 * math.log10(g) if g > 0 else None, "phase_deg": _interp_log(freq, phase, x)}
 
@@ -216,7 +222,9 @@ def tran_summary(t, v):
     n = len(v)
     mean = sum(v) / n
     rms = math.sqrt(sum(x * x for x in v) / n)
-    crossings = [t[i] for i in range(n - 1) if (v[i] - mean) < 0 <= (v[i + 1] - mean)]
+    # Interpolate each rising crossing to remove sampling-grid bias.
+    crossings = [t[i] + ((mean - v[i]) / (v[i + 1] - v[i])) * (t[i + 1] - t[i])
+                 for i in range(n - 1) if (v[i] - mean) < 0 <= (v[i + 1] - mean)]
     period = (crossings[-1] - crossings[0]) / (len(crossings) - 1) if len(crossings) > 2 else None
     return {"max": max(v), "min": min(v), "pp": max(v) - min(v), "mean": mean, "rms": rms,
             "period": period, "freq": 1 / period if period else None}

@@ -145,10 +145,14 @@ def cmd_sim(a):
     ac = None
     if a.ac:
         v = _floats(a.ac, (2, 3))
+        if v[0] <= 0 or v[1] <= v[0] or (len(v) > 2 and (v[2] < 1 or not v[2].is_integer())):
+            raise ValueError("AC sweep requires 0 < start < stop and a positive integer points-per-decade")
         ac = (v[0], v[1], int(v[2]) if len(v) > 2 else 100)
     tran = None
     if a.tran:
         v = _floats(a.tran, (1, 2))
+        if v[0] <= 0 or (len(v) > 1 and v[1] <= 0):
+            raise ValueError("transient duration and optional sample rate must be positive")
         tran = (v[0], v[1] if len(v) > 1 else None)
     if not (a.op or ac or tran):
         raise ValueError("choose at least one analysis: --op / --ac / --tran")
