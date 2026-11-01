@@ -2,7 +2,7 @@
 from pathlib import Path
 
 
-READ_ONLY_COMMANDS = frozenset({"check", "inspect", "cursors"})
+READ_ONLY_COMMANDS = frozenset({"check", "inspect", "cursors", "sections"})
 
 
 def safe_escape_command(argv: list[str]) -> str:

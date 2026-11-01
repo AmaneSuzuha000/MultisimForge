@@ -32,6 +32,11 @@ attributes nor the known RestoreData flag restored them in prior experiments.
 **Working alternative:** `sim --csv` followed by `cursors` reports readings
 interpolated from *real* simulator data, clearly marked `not_gui_cursors`.
 
+**Native UI lead:** NI documents Grapher's `Cursor > Set X value` dialog:
+https://www.ni.com/docs/en-US/bundle/multisim/page/topics/grapher-cursor-menu.html .
+This is a Grapher interaction, not proof that virtual instrument cursor state
+survives a file reopen.
+
 **Native experiments before any UI-control attempt:**
 1. Make an original scope and Bode example with visible T1/T2 and F1/F2 positions.
 2. Save, close, reopen, and inspect both the GUI and the stored XML fields.
@@ -49,6 +54,12 @@ NI GUI cursor. Raw waveform samples must remain accessible.
 **Current limit:** harvested template carries section metadata, but the builder
 places only section A. Another instance is not automatically another section of
 the same physical package. This is now surfaced as a build warning.
+
+**Native API lead:** NI documents the read-only `List Sections` action, which
+enumerates already-used top-level sections of a package:
+https://www.ni.com/docs/en-US/bundle/multisim/page/topics/list-sections.html .
+Run `multisimforge sections test.ms14 U1` against Multisim-authored fixtures
+before implementing any package-creation logic.
 
 **Native evidence required for implementation:**
 1. In Multisim, create one *package* with two sections (U1A/U1B), then all sections

@@ -181,6 +181,12 @@ def sim_status(payload: dict, require_vectors: bool = False):
     return Status.WARN if payload.get("warnings") else Status.PASS
 
 
+def cmd_sections(a):
+    """Read-only native enumeration of sections already placed in one package."""
+    from . import com
+    return com.call({"op": "sections", "ms14": str(Path(a.ms14).resolve()), "ref": a.ref}), Status.PASS
+
+
 def cmd_cursors(a):
     """Numerical cursor readouts from original simulator CSV (not Multisim GUI cursors)."""
     from .measure import measure_csv
@@ -272,6 +278,11 @@ def main(argv=None):
     s.add_argument("cir")
     s.add_argument("--cmd", action="append", required=True, help='analysis command, e.g. "tran 1u 10m"; may be repeated')
     s.set_defaults(func=cmd_spice)
+
+    s = sub.add_parser("sections", help="read-only Multisim ListSections for a package refdes (native COM)")
+    s.add_argument("ms14")
+    s.add_argument("ref", help="package reference designator, e.g. U1")
+    s.set_defaults(func=cmd_sections)
 
     s = sub.add_parser("cursors", help="virtual numerical cursors measured from simulator CSV; no GUI cursor preset")
     s.add_argument("csv", help="AC or transient CSV exported by sim")

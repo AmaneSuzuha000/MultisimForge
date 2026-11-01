@@ -265,7 +265,10 @@ the preservation of the original circuit file's SHA-256. The manually triggered
 
 - **Multisim 14.3 does not restore GUI cursor positions.** Numerical CSV cursor
   readouts solve the measurement workflow but do not move native GUI cursors.
-- **Multi-section parts such as LM324 and 74LS00:** a harvested template places
+- **Multi-section parts such as LM324 and 74LS00:** use
+  `multisimforge sections design.ms14 U1` (or the MCP `list_sections` tool)
+  to query which sections a native Multisim package already contains.
+  This read-only API does not construct additional sections. A harvested template places
   only section A. Builds now report an explicit warning for parts with
   `sections > 1`; separate instances do not share a physical IC package.
   Full section-aware model reconstruction remains unverified and must be tested

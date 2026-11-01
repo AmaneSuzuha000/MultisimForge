@@ -364,6 +364,15 @@ def _execute(app, job):
         c = app.NewFile()
         c.SaveAs(os.path.abspath(job["out"]))
         return {"out": job["out"]}
+    if op == "sections":
+        c = _open(app, job["ms14"])
+        # The native API enumerates currently-used sections; it does not create
+        # new sections or link independently harvested section-A templates.
+        try:
+            values = c.ListSections(job["ref"])
+        except AttributeError as exc:
+            raise RuntimeError("This Multisim automation version does not expose ListSections") from exc
+        return {"ref": job["ref"], "sections": [str(v) for v in (values or ())]}
     if op == "image":
         c = _open(app, job["ms14"])
         c.GetCircuitImage(0, os.path.abspath(job["out"]))

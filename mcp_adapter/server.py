@@ -264,6 +264,12 @@ async def build_schematic(spec: dict[str, Any], preview_png: str = "") -> dict[s
 
 
 @mcp.tool()
+async def list_sections(ms14: str, package_ref: str) -> dict[str, Any]:
+    """Read sections used by one native Multisim package; does not construct new sections."""
+    return await asyncio.to_thread(_run_cli, ["sections", str(_resolve(ms14)), package_ref])
+
+
+@mcp.tool()
 async def cursor_readings(csv_path: str, column: str, x1: str, x2: str,
                           axis: Literal["auto", "linear", "log"] = "auto") -> dict[str, Any]:
     """Read numeric cursors from real simulation CSV without pretending to set GUI cursors."""
