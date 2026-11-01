@@ -262,23 +262,33 @@ async def build_schematic(spec: dict[str, Any], preview_png: str = "") -> dict[s
 
 
 @mcp.tool()
+async def cursor_readings(csv_path: str, column: str, x1: str, x2: str,
+                          axis: Literal["auto", "linear", "log"] = "auto") -> dict[str, Any]:
+    """Read numeric cursors from real simulation CSV without pretending to set GUI cursors."""
+    return await asyncio.to_thread(_run_cli, ["cursors", str(_resolve(csv_path)), "--column", column,
+                                              "--x1", x1, "--x2", x2, "--axis", axis])
+
+
+@mcp.tool()
 async def capture_instruments(
     ms14: str,
     outdir: str = "",
     wait_s: float = 1.5,
     timeout_s: float = 90,
     keep_open: bool = False,
+    desktop_screen: bool = False,
 ) -> dict[str, Any]:
-    """Real screenshots from a running Multisim window: circuit canvas, every instrument
-    panel (XSC scope, XBP bode, ...) and the full screen. Runs the interactive simulation,
-    waits for the trace to settle, and auto-adjusts sim time when the scope scan is not
-    full-width. Multisim comes to the foreground; do not use the mouse while it runs."""
+    """Capture real circuit/panel windows and a labelled foreground-free montage.
+    desktop_screen=True additionally opts into a real desktop photo that steals
+    focus; by default mouse and keyboard remain free."""
     target = _assert_write_target(_resolve(outdir) if outdir else (WORK_DIR / "captures" / f"{Path(ms14).stem}_{_stamp()}"))
     target.mkdir(parents=True, exist_ok=True)
     args = ["capture", str(_resolve(ms14)), str(target), "--wait", str(wait_s),
             "--timeout", str(timeout_s)]
     if keep_open:
         args.append("--keep-open")
+    if desktop_screen:
+        args.append("--desktop-screen")
     result = await asyncio.to_thread(_run_cli, args, timeout_s + 180)
     result["outdir"] = str(target)
     return result
