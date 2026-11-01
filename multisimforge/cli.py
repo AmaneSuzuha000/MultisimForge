@@ -187,7 +187,7 @@ def cmd_cursors(a):
 def cmd_capture(a):
     from . import capture
     r = capture.capture(a.ms14, a.outdir, wait=a.wait, timeout=a.timeout, keep_open=a.keep_open,
-                        on_netlist_error=a.on_netlist_error)
+                        on_netlist_error=a.on_netlist_error, desktop_screen=a.desktop_screen)
     return r, (Status.WARN if r.get("warnings") else Status.PASS)
 
 
@@ -283,6 +283,7 @@ def main(argv=None):
     s.add_argument("--wait", type=_positive, default=1.5, help="how long the display must be still to consider the simulation finished (seconds)")
     s.add_argument("--timeout", type=_positive, default=90, help="maximum wait (seconds)")
     s.add_argument("--keep-open", action="store_true", help="do not close Multisim after capturing")
+    s.add_argument("--desktop-screen", action="store_true", help="opt into real desktop capture requiring foreground; default is PrintWindow montage")
     s.add_argument("--on-netlist-error", choices=["abort", "continue"], default="abort",
                    help="what to do when Multisim reports a netlist error (default: abort and fail)")
     s.set_defaults(func=cmd_capture)
