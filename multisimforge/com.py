@@ -16,10 +16,14 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 
 PROG_ID = "MultisimInterface.MultisimApp"
 CONNECT_TIMEOUT = 10.0          # liveness probe only; the job itself gets the caller's timeout
+_MAX_IPC_BYTES = 64 * 1024 * 1024
+_SPAWN_LOCK = threading.Lock()
 Popen = subprocess.Popen        # one seam for tests; patching subprocess.Popen would leak globally
 
 
@@ -29,6 +33,10 @@ class ComError(RuntimeError):
 
 class JobTimeout(ComError):
     """The daemon accepted the job but did not answer in time; the work may still be running."""
+
+
+class JobIndeterminate(ComError):
+    """The request may have reached Multisim. Never replay it automatically."""
 
 
 # ---------------------------------------------------------------------------
@@ -42,8 +50,30 @@ def _state_path():
 
 def _multisim_pids() -> set:
     out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq multisim.exe", "/FO", "CSV", "/NH"],
-                         capture_output=True, text=True, errors="ignore").stdout
-    return {line.split('","')[1] for line in out.splitlines() if line.startswith('"multisim.exe"')}
+                         capture_output=True, text=True, errors="ignore", stdin=subprocess.DEVNULL).stdout
+    return {line.split('","')[1] for line in out.splitlines() if line.lower().startswith('"multisim.exe",')}
+
+
+def _pid_alive(pid: int) -> bool:
+    if os.name != "nt":
+        return False
+    out = subprocess.run(["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
+                         capture_output=True, text=True, errors="ignore", stdin=subprocess.DEVNULL).stdout
+    return f'"{int(pid)}"' in out
+
+
+def _cleanup_orphans(state: dict | None) -> None:
+    """Terminate Multisim instances spawned by a daemon whose worker process has already died."""
+    if not isinstance(state, dict):
+        return
+    pids = [str(p) for p in (state.get("multisim_pids") or ()) if str(p).isdigit()]
+    if not pids:
+        return
+    daemon_pid = state.get("pid")
+    if isinstance(daemon_pid, int) and _pid_alive(daemon_pid):
+        return
+    for pid in set(pids) & _multisim_pids():
+        subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True, stdin=subprocess.DEVNULL)
 
 
 def _read_state():
@@ -65,7 +95,17 @@ def _read_state():
 def _write_state(state):
     path = _state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state), encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(state))
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _request(job: dict, timeout: float) -> dict:
@@ -80,59 +120,88 @@ def _request(job: dict, timeout: float) -> dict:
     if state:
         try:
             return _roundtrip(state, job, timeout)
-        except JobTimeout:
-            raise                                   # accepted but slow: never replay it
-        except (OSError, ValueError, ComError):
-            pass                                    # daemon has exited; restart it
-    proc = Popen(                                    # module-level alias: patchable without touching subprocess
-        [*python32_argv(), "-X", "utf8", "-m", "multisimforge.com", "--serve"],
-        cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
-    )
-    deadline = time.time() + 90                        # the first connection to Multisim takes about 3-10 seconds
-    while time.time() < deadline:
-        state = _read_state()
-        if state and state.get("pid") == proc.pid:
+        except JobIndeterminate:
+            _cleanup_orphans(_read_state() or state)
+            raise
+        except ComError:
+            raise                                   # accepted, rejected, or indeterminate: never replay
+        except (OSError, ValueError):
+            _cleanup_orphans(_read_state() or state)
+    with _SPAWN_LOCK:
+        fresh = _read_state()
+        if fresh and fresh != state:
             try:
-                return _roundtrip(state, job, timeout)
+                return _roundtrip(fresh, job, timeout)
+            except JobIndeterminate:
+                _cleanup_orphans(_read_state() or fresh)
+                raise
+            except ComError:
+                raise
             except (OSError, ValueError):
-                pass
-        if proc.poll() is not None:
-            break
-        time.sleep(0.2)
-    proc.kill()
-    raise ComError("Cannot start the COM background process (Multisim automation interface unavailable)")
+                _cleanup_orphans(_read_state() or fresh)
+        proc = Popen(                                # module-level alias: patchable without touching subprocess
+            [*python32_argv(), "-X", "utf8", "-m", "multisimforge.com", "--serve"],
+            cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
+        )
+        deadline = time.time() + 90                    # the first connection to Multisim takes about 3-10 seconds
+        while time.time() < deadline:
+            cur = _read_state()
+            if cur and cur.get("pid") == proc.pid:
+                try:
+                    return _roundtrip(cur, job, timeout)
+                except ComError:
+                    raise
+                except (OSError, ValueError):
+                    pass
+            if proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        proc.kill()
+        raise ComError("Cannot start the COM background process (Multisim automation interface unavailable)")
 
 
 def _roundtrip(state: dict, job: dict, timeout: float) -> dict:
     payload = dict(job, token=state.get("token"))
-    sent = False
+    submitted = False
     try:
-        # Only the TCP connect gets the short probe timeout; once connected, the job
-        # itself may legitimately run for the caller's full timeout.
+        # Once sending starts, a partial write may already have reached the worker.
         with socket.create_connection(("127.0.0.1", int(state["port"])),
                                       timeout=min(timeout, CONNECT_TIMEOUT)) as sock:
             sock.settimeout(timeout)                    # honour the caller's budget exactly
+            submitted = True
             sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-            sent = True
             chunks = []
+            total = 0
             while True:
                 block = sock.recv(65536)
                 if not block:
                     break
+                total += len(block)
+                if total > _MAX_IPC_BYTES:
+                    raise JobIndeterminate("COM daemon response exceeded maximum allowed size")
                 chunks.append(block)
                 if block.endswith(b"\n"):
                     break
     except socket.timeout as exc:
-        if sent:
-            raise JobTimeout(str(exc)) from None
+        if submitted:
+            raise JobTimeout(str(exc)) from exc
+        raise
+    except OSError as exc:
+        if submitted:
+            raise JobIndeterminate(f"COM connection lost after request submission: {exc}") from exc
         raise
     text = b"".join(chunks).decode("utf-8", "replace").strip()
     if not text:
-        raise ValueError("daemon returned no result")
-    result = json.loads(text)
+        raise JobIndeterminate("COM daemon closed without a result after request submission")
+    try:
+        result = json.loads(text)
+    except ValueError as exc:
+        raise JobIndeterminate("COM daemon returned malformed JSON after request submission") from exc
+    if not isinstance(result, dict):
+        raise JobIndeterminate("COM daemon returned non-object JSON after request submission")
     if result.get("error"):
-        raise ComError(result["error"])
+        raise ComError(result["error"])                 # completed cleanly with business error; do not retry
     return result
 
 
@@ -140,15 +209,16 @@ def call(job: dict, timeout: float = 300) -> dict:
     """Run one COM job. Reuses the background daemon when possible and falls back to a one-shot subprocess on failure.
 
     Only a failure to reach the daemon falls back; once the daemon has accepted the job,
-    a timeout is reported as an error instead of being replayed, so a slow simulation is
-    never executed twice.
+    a timeout or uncertain disconnect is reported as an error instead of being replayed.
     """
     try:
         return _request(job, timeout)
     except JobTimeout as exc:
         raise ComError(f"Multisim COM job {job.get('op')} timed out after {timeout:g}s; it may still be running, "
                        f"so it was not retried ({exc})") from None
-    except (ComError, OSError, ValueError):
+    except ComError:
+        raise                                           # worker answered, or submission is uncertain
+    except (OSError, ValueError):
         return _oneshot(job, timeout)
 
 
@@ -161,6 +231,13 @@ def stop() -> bool:
         _roundtrip(state, {"op": "shutdown"}, 10)
     except (ComError, OSError, ValueError):
         pass
+    latest = _read_state() or state
+    daemon_pid = latest.get("pid")
+    if isinstance(daemon_pid, int) and latest.get("multisim_pids"):
+        deadline = time.time() + 1.5
+        while time.time() < deadline and _pid_alive(daemon_pid):
+            time.sleep(0.1)
+    _cleanup_orphans(latest)
     try:
         _state_path().unlink()
     except OSError:
@@ -197,9 +274,11 @@ def _oneshot(job: dict, timeout: float) -> dict:
             result = json.loads(lines[-1])
         except json.JSONDecodeError:
             pass
+    if proc is not None and proc.returncode != 0 and result is not None:
+        result = {"error": f"worker exited {proc.returncode} despite a JSON reply"}
     if result is None or result.get("error"):
         for pid in _multisim_pids() - before:      # if the process dies abnormally, the Multisim instance it started is not closed automatically
-            subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True)
+            subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True, stdin=subprocess.DEVNULL)
         if result is None:
             detail = "timeout" if proc is None else f"process exit code {proc.returncode}, {(proc.stderr or '').strip()[-400:]}"
             raise ComError(f"Multisim COM job {job.get('op')} failed ({detail})")
@@ -327,7 +406,11 @@ def _spice(app, job):
     deadline = time.time() + float(job.get("timeout", 120))
     while c.SimulationState and time.time() < deadline:
         time.sleep(0.2)
-    text = open(log, encoding="utf-8", errors="replace").read() if os.path.exists(log) else ""
+    if os.path.exists(log):
+        with open(log, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    else:
+        text = ""
     from .xmlio import decode_uc
     text = decode_uc(text)
     return {"raw": raw if os.path.exists(raw) else None, "log": text[-4000:], "last_error": _clean(c.LastErrorMessage)}
@@ -349,6 +432,18 @@ def _execute(app, job):
         c = app.NewFile()
         c.SaveAs(os.path.abspath(job["out"]))
         return {"out": job["out"]}
+    if op == "sections":
+        c = _open(app, job["ms14"])
+        # NI Multisim 14.3 COM exposes EnumSections (documented as "List Sections");
+        # it enumerates placed sections read-only and does not create sections.
+        names = list(c.EnumComponents(0) or ())
+        if job["ref"] not in names:
+            raise ValueError(f"{job['ref']} not found in the design; existing {names}")
+        enum_fn = getattr(c, "EnumSections", None) or getattr(c, "ListSections", None)
+        if enum_fn is None:
+            raise RuntimeError("This Multisim automation version does not expose EnumSections")
+        values = [str(v) for v in (enum_fn(job["ref"]) or ()) if str(v)]
+        return {"ref": job["ref"], "sections": values, "single_section": not values}
     if op == "image":
         c = _open(app, job["ms14"])
         c.GetCircuitImage(0, os.path.abspath(job["out"]))
@@ -381,11 +476,15 @@ def _serve():
     import threading
     from .config import CONFIG
 
-    app_holder = {"app": None, "busy": threading.Lock()}
+    app_holder = {"app": None, "busy": threading.Lock(), "multisim_pids": []}
 
     def app():
         if app_holder["app"] is None:
+            before = _multisim_pids()
             app_holder["app"] = _connect()
+            owned = sorted(_multisim_pids() - before)
+            app_holder["multisim_pids"] = owned
+            _write_state({"port": port, "token": token, "pid": os.getpid(), "multisim_pids": owned})
         return app_holder["app"]
 
     def drop():
@@ -399,17 +498,25 @@ def _serve():
     server.bind(("127.0.0.1", 0))
     server.listen(4)
     port = server.getsockname()[1]
-    _write_state({"port": port, "token": token, "pid": os.getpid()})
+    _write_state({"port": port, "token": token, "pid": os.getpid(), "multisim_pids": []})
     idle = float(CONFIG.get("com_idle_timeout") or 900)
     last = time.time()
 
     def handle(conn):
-        buffer = b""
-        while not buffer.endswith(b"\n"):
+        chunks = []
+        total = 0
+        while True:
             block = conn.recv(65536)
             if not block:
                 return
-            buffer += block
+            total += len(block)
+            if total > _MAX_IPC_BYTES:
+                conn.sendall(b'{"error": "request too large"}\n')
+                return
+            chunks.append(block)
+            if block.endswith(b"\n"):
+                break
+        buffer = b"".join(chunks)
         try:
             job = json.loads(buffer.decode("utf-8"))
         except ValueError:
@@ -450,7 +557,18 @@ def _serve():
             finally:
                 conn.close()
     finally:
+        had_app = app_holder["app"] is not None
         drop()
+        if had_app:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+        try:
+            server.close()
+        except OSError:
+            pass
         try:
             _state_path().unlink()
         except OSError:

@@ -8,28 +8,86 @@ Output:
     <stem>_screen.png       full-screen capture with the panels overlaid on the circuit window
 """
 import ctypes
-import re
 import hashlib
+import re
 import subprocess
+import sys
 import time
 from pathlib import Path
-
-import numpy as np
-import win32api
-import win32con
-import win32gui
-import win32process
-import win32ui
-from PIL import Image, ImageGrab
-from scipy import ndimage
 
 from . import xmlio
 from .config import CONFIG
 
-ctypes.windll.shcore.SetProcessDpiAwareness(2)
-user32 = ctypes.windll.user32
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    from PIL import Image, ImageGrab
+except ImportError:
+    Image = None
+    ImageGrab = None
+
+try:
+    from scipy import ndimage
+except ImportError:
+    ndimage = None
+
+if sys.platform == "win32":
+    try:
+        import win32api
+        import win32con
+        import win32gui
+        import win32process
+        import win32ui
+    except ImportError:
+        win32api = win32con = win32gui = win32process = win32ui = None
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+    user32 = ctypes.windll.user32
+else:
+    win32api = win32con = win32gui = win32process = win32ui = None
+    user32 = None
+
 PANEL_HINTS = ("XSC", "XBP", "XFG", "XMM", "\u793a\u6ce2\u5668", "\u6ce2\u7279", "\u51fd\u6570", "\u4e07\u7528\u8868",
                "Oscilloscope", "Bode", "Function", "Multimeter")
+
+
+def _require_capture_deps():
+    missing = [name for name, mod in (
+        ("pywin32", win32gui), ("Pillow", Image), ("numpy", np), ("scipy", ndimage)
+    ) if mod is None]
+    if missing:
+        raise RuntimeError(f"Capture extras not installed ({', '.join(missing)}); install with pip install -e .[capture]")
+
+
+def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        kernel32 = getattr(ctypes, "windll", None) and ctypes.windll.kernel32
+        if kernel32 is not None:
+            from ctypes import wintypes
+            open_proc = kernel32.OpenProcess
+            open_proc.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            open_proc.restype = wintypes.HANDLE
+            get_code = kernel32.GetExitCodeProcess
+            get_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            get_code.restype = wintypes.BOOL
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            handle = open_proc(0x1000, False, int(pid))
+            if not handle:
+                return False
+            try:
+                code = wintypes.DWORD()
+                if get_code(handle, ctypes.byref(code)):
+                    return code.value == 259  # STILL_ACTIVE
+            finally:
+                close_handle(handle)
+    return any(p == pid for _, _, _, p in top_windows())
 
 
 class NetlistError(RuntimeError):
@@ -73,23 +131,33 @@ def capture_copy(source: Path, work: Path) -> Path:
     return copy
 
 
-def grab(hwnd: int) -> Image.Image:
+def grab(hwnd: int):
+    _require_capture_deps()
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
     w, h = right - left, bottom - top
+    if w <= 0 or h <= 0:
+        raise RuntimeError(f"Window {hwnd} has zero area ({w}x{h}); cannot capture")
     hdc = win32gui.GetWindowDC(hwnd)
-    src = win32ui.CreateDCFromHandle(hdc)
-    mem = src.CreateCompatibleDC()
-    bmp = win32ui.CreateBitmap()
-    bmp.CreateCompatibleBitmap(src, w, h)
-    mem.SelectObject(bmp)
-    user32.PrintWindow(hwnd, mem.GetSafeHdc(), 2)     # PW_RENDERFULLCONTENT: renders fully even when occluded
-    info = bmp.GetInfo()
-    img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), bmp.GetBitmapBits(True), "raw", "BGRX", 0, 1)
-    win32gui.DeleteObject(bmp.GetHandle())
-    mem.DeleteDC()
-    src.DeleteDC()
-    win32gui.ReleaseDC(hwnd, hdc)
-    return img.copy()
+    src = mem = bmp = None
+    try:
+        src = win32ui.CreateDCFromHandle(hdc)
+        mem = src.CreateCompatibleDC()
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(src, w, h)
+        mem.SelectObject(bmp)
+        if not user32.PrintWindow(hwnd, mem.GetSafeHdc(), 2):     # PW_RENDERFULLCONTENT: renders fully even when occluded
+            raise RuntimeError(f"PrintWindow returned failure for window {hwnd}; refusing to save a blank screenshot")
+        info = bmp.GetInfo()
+        img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), bmp.GetBitmapBits(True), "raw", "BGRX", 0, 1)
+        return img.copy()
+    finally:
+        if bmp is not None:
+            win32gui.DeleteObject(bmp.GetHandle())
+        if mem is not None:
+            mem.DeleteDC()
+        if src is not None:
+            src.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hdc)
 
 
 def bring_to_front(hwnd: int) -> bool:
@@ -138,15 +206,21 @@ def dismiss_netlist_warning(pid: int) -> dict:
     build the circuit it is about to simulate, so the caller must treat it as a
     failed run unless the user explicitly allowed continuing.
     """
-    for hwnd, title, cls, _ in top_windows(pid):
-        if title != "\u7f51\u8868\u9519\u8bef":
+    for hwnd, title, _cls, _ in top_windows(pid):
+        low_title = title.strip().lower()
+        if title != "\u7f51\u8868\u9519\u8bef" and "netlist error" not in low_title:
             continue
         text = []
         win32gui.EnumChildWindows(
             hwnd, lambda h, _: text.append(win32gui.GetWindowText(h)) if win32gui.GetWindowText(h) else None, None)
         buttons = []
-        win32gui.EnumChildWindows(
-            hwnd, lambda h, _: buttons.append(h) if win32gui.GetWindowText(h).startswith("\u662f") else None, None)
+
+        def collect_yes(h, _):
+            lbl = win32gui.GetWindowText(h).lstrip("&").strip()
+            if lbl.startswith("\u662f") or lbl.lower() == "yes":
+                buttons.append(h)
+
+        win32gui.EnumChildWindows(hwnd, collect_yes, None)
         clicked = False
         for button in buttons:
             win32api.PostMessage(button, win32con.BM_CLICK, 0, 0)
@@ -178,7 +252,7 @@ def _longest_run(mask, gap=6):
     return best
 
 
-def scope_coverage(img: Image.Image) -> float:
+def scope_coverage(img) -> float:
     """Fraction of columns (0-1) in the oscilloscope's black display area that contain colored waveforms."""
     a = np.asarray(img).astype(int)
     dark = a.sum(axis=2) < 60
@@ -205,14 +279,14 @@ def _view_rect(main: int):
     return found[0] if found else None
 
 
-def drawing_area(main: int, img: Image.Image) -> Image.Image:
+def drawing_area(main: int, img):
     """Crop to the drawing view (excluding menus, toolbars, the design toolbox, and the bottom spreadsheet view)."""
     left, top, *_ = win32gui.GetWindowRect(main)
     r = _view_rect(main)
     return img.crop((r[0] - left, r[1] - top, r[2] - left, r[3] - top)) if r else img
 
 
-def ink_mask(img: Image.Image):
+def ink_mask(img):
     """Ink mask within the white page area (black line art/text or highly saturated color); returns (mask, page top-left offset)."""
     a = np.asarray(img).astype(int)
     lo, hi = a.min(axis=2), a.max(axis=2)
@@ -232,7 +306,7 @@ def ink_mask(img: Image.Image):
     return ink, (c0, r0)
 
 
-def frame_inner(img: Image.Image):
+def frame_inner(img):
     """Inner drawing frame (inside the zone numbering strip): gray lines near the page edges that span the whole page."""
     a = np.asarray(img).astype(int)
     lo, hi = a.min(axis=2), a.max(axis=2)
@@ -244,7 +318,7 @@ def frame_inner(img: Image.Image):
             min([c for c in cols if c > w * 0.7], default=w), min([r for r in rows if r > h * 0.7], default=h))
 
 
-def crop_ink(img: Image.Image, margin=40) -> Image.Image:
+def crop_ink(img, margin=40):
     ink, (ox, oy) = ink_mask(img)
     rows = np.where(ink.sum(axis=1) > 2)[0]
     cols = np.where(ink.sum(axis=0) > 2)[0]
@@ -260,15 +334,18 @@ def crop_ink(img: Image.Image, margin=40) -> Image.Image:
     return img.crop((left, top, right, bottom))
 
 
-def arrange_panels(main: int, pid: int, view: Image.Image):
+def arrange_panels(main: int, pid: int, view):
     """Move panels to the corner of the drawing view with the least circuit ink so they block as little as possible."""
     rect = _view_rect(main)
     if rect is None:
         return
     vx0, vy0, vx1, vy1 = rect
     ink, (ox, oy) = ink_mask(view)
-    occupied = np.zeros((vy1 - vy0, vx1 - vx0), bool)
-    occupied[oy:oy + ink.shape[0], ox:ox + ink.shape[1]] = ink[:occupied.shape[0] - oy, :occupied.shape[1] - ox]
+    occupied = np.zeros((max(0, vy1 - vy0), max(0, vx1 - vx0)), bool)
+    h_copy = min(ink.shape[0], max(0, occupied.shape[0] - max(oy, 0)))
+    w_copy = min(ink.shape[1], max(0, occupied.shape[1] - max(ox, 0)))
+    if h_copy > 0 and w_copy > 0:
+        occupied[max(oy, 0):max(oy, 0) + h_copy, max(ox, 0):max(ox, 0) + w_copy] = ink[:h_copy, :w_copy]
     for hwnd, _ in panels(pid, main):
         l, t, r, b = win32gui.GetWindowRect(hwnd)
         w, h, pad = r - l, b - t, 20
@@ -276,24 +353,41 @@ def arrange_panels(main: int, pid: int, view: Image.Image):
 
         def cost(pos):
             x, y = pos[0] - vx0, pos[1] - vy0
-            return occupied[max(y, 0):y + h, max(x, 0):x + w].sum()
+            return occupied[max(y, 0):max(y + h, 0), max(x, 0):max(x + w, 0)].sum()
         x, y = min(corners, key=cost)
         win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, x, y, 0, 0, win32con.SWP_NOSIZE)
-        occupied[max(y - vy0, 0):y - vy0 + h, max(x - vx0, 0):x - vx0 + w] = True
+        occupied[max(y - vy0, 0):max(y - vy0 + h, 0), max(x - vx0, 0):max(x - vx0 + w, 0)] = True
 
 
 def open_design(ms14: Path):
     """Return (main window, process ID, whether it was launched by this call)."""
+    _require_capture_deps()
     existing = design_windows(ms14.stem)
     if existing:
         raise RuntimeError(
             f"{len(existing)} Multisim window(s) are already open for a design named {ms14.stem!r} "
             f"(pids {sorted({p for _, p in existing})}). Capture cannot tell which file such a window "
             f"shows, so close it first; capture opens its own copy and closes it afterwards")
+    proc = subprocess.Popen([CONFIG["multisim_exe"], str(ms14)])
+    try:
+        return _wait_for_open_design(ms14, proc)
+    except BaseException:
+        # Only terminate the process we launched, never an existing user instance.
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except OSError:
+            pass
+        raise
+
+
+def _wait_for_open_design(ms14: Path, proc):
+    """Resolve the new window or fail; open_design owns cleanup before handoff."""
     main, pid = None, None
-    subprocess.Popen([CONFIG["multisim_exe"], str(ms14)])
     deadline = time.time() + 120
     while main is None and time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"Multisim exited before opening {ms14.name} (exit={proc.returncode})")
         time.sleep(1)
         found = design_windows(ms14.stem)
         if len(found) > 1:
@@ -313,75 +407,89 @@ def open_design(ms14: Path):
 
 
 def run_once(ms14: Path, out: Path, wait: float, timeout: float, on_netlist_error: str = "abort",
-             stem: str | None = None):
+             stem: str | None = None, desktop_screen: bool = False):
+    _require_capture_deps()
     stem = stem or ms14.stem                      # the original name drives the file names we write
     main, pid, launched = open_design(ms14)
-    result = {"ms14": str(ms14), "images": {}, "warnings": [], "netlist_errors": []}
-    send_key(main, win32con.VK_F5)
-    deadline = time.time() + 15
-    while not panels(pid, main) and time.time() < deadline:
-        dialog = dismiss_netlist_warning(pid)
-        if dialog["found"]:
-            result["netlist_errors"].append(dialog)
-            if on_netlist_error == "abort":
-                raise NetlistError(dialog)
-        time.sleep(0.5)
-    if not panels(pid, main):
-        result["warnings"].append("No instrument panels appeared after running: check the instruments' show settings")
-    # The simulation stops automatically at sim_time: wait until the panel images stop changing before capturing
-    previous, stable_since = None, None
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(0.7)
-        dialog = dismiss_netlist_warning(pid)
-        if dialog["found"]:
-            result["netlist_errors"].append(dialog)
-            if on_netlist_error == "abort":
-                raise NetlistError(dialog)
-        shots = [np.asarray(grab(h)) for h, _ in panels(pid, main)]
-        same = previous is not None and len(shots) == len(previous) and all(
-            a.shape == b.shape and (a == b).all() for a, b in zip(shots, previous))
-        previous = shots
-        if not same:
-            stable_since = None
-        elif stable_since is None:
-            stable_since = time.time()
-        elif time.time() - stable_since >= wait:
-            break
-    else:
-        send_key(main, win32con.VK_F6)
-        time.sleep(1.0)
-        result["warnings"].append("The simulation did not stop before the timeout; paused manually: check sim_time")
-    worst = 1.0
-    for hwnd, title in panels(pid, main):
-        name = title.split("-")[-1].strip() or "panel"
-        img = grab(hwnd)
-        path = out / f"{stem}_{name}.png"
-        img.save(path)
-        result["images"][name] = str(path)
-        if "XSC" in title or "\u793a\u6ce2\u5668" in title:
-            coverage = scope_coverage(img)
-            result.setdefault("scope_coverage", {})[name] = round(coverage, 2)
-            worst = min(worst, coverage)
-    view = drawing_area(main, grab(main))
-    crop_ink(view).save(out / f"{stem}_circuit.png")
-    result["images"]["circuit"] = str(out / f"{stem}_circuit.png")
-    # Full-screen capture: grab the screen after bringing Multisim to the foreground; panels overlay the circuit window at their real positions
-    # The panel images above come from PrintWindow, which renders an occluded window. This one
-    # composites the real desktop, so it needs Multisim on top: the end user's cursor and any
-    # other window would otherwise be baked into the picture. It is the only step that borrows
-    # the foreground, and it is skipped rather than faked when the foreground cannot be taken.
-    if bring_to_front(main):
-        arrange_panels(main, pid, view)
-        time.sleep(0.8)
-        l, t, r, b = win32gui.GetWindowRect(main)
-        ImageGrab.grab(bbox=(max(l, 0), max(t, 0), r, b), all_screens=True).save(out / f"{stem}_screen.png")
-        result["images"]["screen"] = str(out / f"{stem}_screen.png")
-    else:
-        result["warnings"].append(
-            "Could not bring Multisim to the foreground, so no desktop screenshot was taken "
-            "(the circuit and panel images above are unaffected); leave the mouse and keyboard alone while capturing")
-    return result, pid, launched, worst
+    try:
+        result = {"ms14": str(ms14), "images": {}, "warnings": [], "netlist_errors": []}
+        send_key(main, win32con.VK_F5)
+        deadline = time.time() + 15
+        while not panels(pid, main) and time.time() < deadline:
+            dialog = dismiss_netlist_warning(pid)
+            if dialog["found"]:
+                result["netlist_errors"].append(dialog)
+                if on_netlist_error == "abort":
+                    raise NetlistError(dialog)
+            time.sleep(0.5)
+        if not panels(pid, main):
+            result["warnings"].append("No instrument panels appeared after running: check the instruments' show settings")
+        # The simulation stops automatically at sim_time: wait until the panel images stop changing before capturing
+        previous, stable_since = None, None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.7)
+            dialog = dismiss_netlist_warning(pid)
+            if dialog["found"]:
+                result["netlist_errors"].append(dialog)
+                if on_netlist_error == "abort":
+                    raise NetlistError(dialog)
+            shots = [np.asarray(grab(h)) for h, _ in panels(pid, main)]
+            same = previous is not None and len(shots) == len(previous) and all(
+                a.shape == b.shape and (a == b).all() for a, b in zip(shots, previous))
+            previous = shots
+            if not same:
+                stable_since = None
+            elif stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= wait:
+                break
+        else:
+            send_key(main, win32con.VK_F6)
+            time.sleep(1.0)
+            result["warnings"].append("The simulation did not stop before the timeout; paused manually: check sim_time")
+        worst = 1.0
+        for hwnd, title in panels(pid, main):
+            name = title.split("-")[-1].strip() or "panel"
+            img = grab(hwnd)
+            path = out / f"{stem}_{name}.png"
+            img.save(path)
+            result["images"][name] = str(path)
+            if "XSC" in title or "\u793a\u6ce2\u5668" in title:
+                coverage = scope_coverage(img)
+                result.setdefault("scope_coverage", {})[name] = round(coverage, 2)
+                worst = min(worst, coverage)
+        view = drawing_area(main, grab(main))
+        crop_ink(view).save(out / f"{stem}_circuit.png")
+        result["images"]["circuit"] = str(out / f"{stem}_circuit.png")
+        # Assemble actual window bitmaps without stealing desktop focus.
+        # Explicitly label this as a composite, not a native desktop screenshot.
+        from .imaging import evidence_montage
+        panel_images = [(title.split("-")[-1].strip() or "panel", grab(hwnd))
+                        for hwnd, title in panels(pid, main)]
+        montage = evidence_montage(grab(main), panel_images)
+        montage_path = out / f"{stem}_montage.png"
+        montage.save(montage_path)
+        result["images"]["montage"] = str(montage_path)
+        result["montage_method"] = "PrintWindow contact sheet; not a desktop screenshot"
+        if desktop_screen:
+            if bring_to_front(main):
+                arrange_panels(main, pid, view)
+                time.sleep(0.8)
+                l, t, r, b = win32gui.GetWindowRect(main)
+                ImageGrab.grab(bbox=(max(l, 0), max(t, 0), r, b), all_screens=True).save(out / f"{stem}_screen.png")
+                result["images"]["screen"] = str(out / f"{stem}_screen.png")
+            else:
+                result["warnings"].append("Could not take the opt-in desktop screenshot; montage and raw panel images are available")
+        return result, pid, launched, worst
+    except BaseException:
+        # The caller cannot receive pid/launched when run_once raises.
+        if launched:
+            try:
+                _close(pid, main)
+            except Exception:
+                pass
+        raise
 
 
 def sweep_info(ms14: Path):
@@ -411,19 +519,21 @@ def _close(pid: int, main=None) -> None:
         pass
     deadline = time.time() + 6
     while time.time() < deadline:
-        if not any(p == pid for _, _, _, p in top_windows()):
+        if not _pid_alive(pid):
             return
         time.sleep(0.5)
-    subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+    subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, stdin=subprocess.DEVNULL)
 
 
-def capture(ms14, outdir, wait=1.5, timeout=90, keep_open=False, on_netlist_error="abort") -> dict:
+def capture(ms14, outdir, wait=1.5, timeout=90, keep_open=False, on_netlist_error="abort",
+            desktop_screen=False) -> dict:
     """Capture a real Multisim run.
 
     The input design is never modified: every run works on a copy inside
     work/capture/<run_id>/. A netlist error makes the run fail unless
     on_netlist_error="continue"; the dialog is always recorded in the result.
     """
+    _require_capture_deps()
     from .builder import set_sim_time
     from . import com
     from .result import new_run_id
@@ -440,7 +550,8 @@ def capture(ms14, outdir, wait=1.5, timeout=90, keep_open=False, on_netlist_erro
     sim_time, sweep = sweep_info(copy)
     pid, launched = None, False
     try:
-        result, pid, launched, worst = run_once(copy, out, wait, timeout, on_netlist_error, stem=source.stem)
+        result, pid, launched, worst = run_once(copy, out, wait, timeout, on_netlist_error, stem=source.stem,
+                                                desktop_screen=desktop_screen)
         if worst < 0.9 and launched and sim_time and sweep and sim_time < 1e20:
             # The sweep start is fixed for a given circuit: extend the end time until this screen is almost fully swept, then run again
             _close(pid)
@@ -449,7 +560,8 @@ def capture(ms14, outdir, wait=1.5, timeout=90, keep_open=False, on_netlist_erro
             new_time = sim_time + (0.99 - worst) * sweep
             set_sim_time(copy, new_time)          # only the working copy is retimed
             first = result
-            result, pid, launched, worst = run_once(copy, out, wait, timeout, on_netlist_error, stem=source.stem)
+            result, pid, launched, worst = run_once(copy, out, wait, timeout, on_netlist_error, stem=source.stem,
+                                                    desktop_screen=desktop_screen)
             result["warnings"] = first["warnings"] + result["warnings"]
             result["netlist_errors"] = first["netlist_errors"] + result["netlist_errors"]
             result["sim_time_adjusted"] = new_time
@@ -467,6 +579,7 @@ def capture(ms14, outdir, wait=1.5, timeout=90, keep_open=False, on_netlist_erro
         "input_unchanged": input_sha == after_sha,
         "working_copy": str(copy),
         "on_netlist_error": on_netlist_error,
+        "desktop_screen_requested": bool(desktop_screen),
     })
     if input_sha != after_sha:
         raise RuntimeError(f"the input design changed during capture ({source}); this is a bug, the run is not trustworthy")

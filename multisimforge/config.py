@@ -118,7 +118,8 @@ def _detect_python32() -> str:
         if _exists(guess):
             return str(guess)
     try:                                   # fallback: hand off to the py launcher
-        out = subprocess.run(["py", "-3-32", "-c", "import win32com"], capture_output=True, text=True, timeout=20)
+        out = subprocess.run(["py", "-3-32", "-c", "import win32com"], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=20)
         if out.returncode == 0:
             return "py -3-32"
     except (OSError, subprocess.SubprocessError):
@@ -143,7 +144,13 @@ def _load() -> dict:
     merged = dict(_DEFAULTS)
     path = ROOT / "config.json"
     if path.exists():
-        merged.update(json.loads(path.read_text(encoding="utf-8")))
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{path} must contain a JSON object")
+        merged.update(loaded)
     for key in _DEFAULTS:                  # environment variables take precedence
         env = os.environ.get("MULTISIMFORGE_" + key.upper())
         if env:

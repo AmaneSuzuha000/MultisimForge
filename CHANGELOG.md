@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - reliability and audit hardening
+
+- Fixed two unsafe COM replay paths (including daemon business errors and transport
+  disconnects after submission), atomic daemon state writes, case-insensitive
+  Multisim PID detection, and cleanup of daemon-owned orphaned `multisim.exe`
+  processes on abnormal disconnect (`com.py`).
+- Populated `<RefDesPrefixUsageMap>` and exact `RefDesStrSize` in `builder.py`
+  and relocated ASCII carrier staging in `parts fetch`, eliminating the
+  deterministic `0xC0000374` COM `ReplaceComponent` crashes across analog, power,
+  opamp, timer, TTL, and CMOS parts, while extending restart/recovery to
+  `JobIndeterminate` disconnects.
+- Fixed real Multisim 14.3 COM `sections` queries to call `EnumSections` with
+  component existence validation, and returned structured `blocked: True` payloads
+  for policy-denied MCP tool calls under `mcp>=2.3.0`.
+- Offline checker now identifies wires with only one unattached endpoint, scopes
+  analysis to the primary `CIITDiagram`, handles animation symbols and same-named
+  `CiNode` groups, distinguishes hidden power pins from visible pin labels, and
+  improves performance and accuracy in routing and auto-repair.
+- DCL decoder/encoder validate zero/oversized/truncated bitstreams and improve
+  `implode`/`explode` throughput while preserving exact sample round-trips.
+- Probe injection avoids ID and refdes/output-variable collisions on already-probed
+  schematics and rejects ground-only measurement targets.
+- Hardened `access.safe_escape_command` against repeated `--debug` prefixes, scoped
+  MCP output writes, and denied mutating `run_cli` / library actions by default.
+- Added measured numerical CSV cursors (`cursors`), read-only `sections` query,
+  foreground-free `PrintWindow` montage (`imaging.py`), opt-in `--desktop-screen`,
+  English & Chinese netlist-dialog handling, and GUI exception cleanup.
+- Corrected cross-platform `python32` configuration test and XML/parts edge cases.
+- Warn on section-A-only use of multi-section part templates.
+
 ## [0.1.6] - 2026-10-31
 
 Tests for the two modules that touch the operating system: the screenshot helpers and

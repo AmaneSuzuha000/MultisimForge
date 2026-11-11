@@ -47,19 +47,22 @@ def symbol_bbox(sym_item):
 
 
 class Circuit:
-    """Read-only view of a .ms14: components, ports, nets, wires, and graphical connectivity."""
+    """Read-only view of a .ms14 primary schematic: components, ports, nets, wires, and graphical connectivity."""
 
-    def __init__(self, root):
+    def __init__(self, root, diagram=None):
         self.root = root
+        self.diagram = diagram if diagram is not None else next(root.iter("CIITDiagram"), None)
+        scope = self.diagram if self.diagram is not None else root
         self.items = {}
-        for it in root.iter("Item"):
+        for it in scope.iter("Item"):
             key = it.get("CiID") or it.get("ID")
             if key and len(it):
                 self.items[key] = it
         self.comps = {k: it for k, it in self.items.items() if it.get("Class") == "CiComponent"}
         self.ports = {k: it for k, it in self.items.items() if it.get("Class") == "CiPort"}
         self.nodes = {k: it for k, it in self.items.items() if it.get("Class") == "CiNode"}
-        self.symbols = {k: it for k, it in self.items.items() if it.get("Class") == "CIITSymbolComp"}
+        self.symbols = {k: it for k, it in self.items.items()
+                        if it.get("Class") in ("CIITSymbolComp", "CIITAnimationSymbolComp")}
         self.wires = {k: it for k, it in self.items.items() if it.get("Class") == "CIITLinkComp"}
 
     def comp_name(self, comp_id):
@@ -71,11 +74,27 @@ class Circuit:
         return f"{self.comp_name(port.get('Component'))}.{xmlio.unasc(port.get('LocalName'))}"
 
     def electrical_nets(self) -> dict:
-        """{net name: {component.pin, ...}} (ground symbols are not included)."""
+        """{net name: {component.pin, ...}} (ground symbols are not included; same-named nodes merge)."""
         out = {}
         for it in self.nodes.values():
-            members = {self.port_label(p.get("CiID")) for p in it[0].find("Ports") if p.get("CiID") in self.ports}
-            out[xmlio.unasc(it[0].get("LocalName")).lower()] = {m for m in members if not m.startswith("0.")}
+            ports_el = it[0].find("Ports")
+            if ports_el is None:
+                continue
+            members = {self.port_label(p.get("CiID")) for p in ports_el if p.get("CiID") in self.ports}
+            net = xmlio.unasc(it[0].get("LocalName")).lower()
+            out.setdefault(net, set()).update(m for m in members if not m.startswith("0."))
+        return out
+
+    def visible_pin_labels(self) -> set:
+        """Every visible symbol pin on the sheet (excluding hidden power pins and ground symbols)."""
+        out = set()
+        for sym in self.symbols.values():
+            for pin_item in sym[0].findall("./Objects/Item[@Class='CIITPinSymbolComp']"):
+                pid = pin_item[0].get("PortID")
+                if pid in self.ports:
+                    label = self.port_label(pid)
+                    if not label.startswith("0."):
+                        out.add(label)
         return out
 
     def pin_labels(self) -> set:
@@ -90,10 +109,13 @@ class Circuit:
     def refdes_counts(self) -> dict:
         """{refdes: times it appears on the sheet}; a real design never repeats one.
 
-        Ground symbols are all named "0" by Multisim, so they are not counted.
+        Ground symbols ("0"), repeated power supply symbols, and on-page connectors are skipped.
         """
         counts = {}
         for it in self.comps.values():
+            ident = identity(it[0])
+            if ident is None or ident[1] == "POWER_SOURCES" or ident[2] == "ground":
+                continue
             name = xmlio.unasc(it[0].get("LocalName"))
             if name in ("", "0"):
                 continue
@@ -101,23 +123,22 @@ class Circuit:
         return counts
 
     def dangling_wires(self):
-        """Wires whose ends are attached to nothing: a leftover of an interrupted edit.
-
-        A wire end names a pin connector (CODPinComp), a port, or a node, so all of
-        those count as attached; anything else means the wire hangs in the air.
-        """
+        """Wires with one or both ends unattached: leftover from an interrupted or corrupt edit."""
         attached = set(self.ports) | set(self.nodes)
         for key, it in self.items.items():
             if it.get("Class") == "CODPinComp":
                 attached.add(key)
-                attached.update(link.get("ID") for link in it[0].find("ConnectList"))
+                clist = it[0].find("ConnectList")
+                if clist is not None:
+                    attached.update(link.get("ID") for link in clist)
         out = []
         for key, it in self.wires.items():
             ends = (it[0].get("Connect1"), it[0].get("Connect2"))
-            if not any(end in attached for end in ends):
+            invalid = [i for i, end in enumerate(ends, 1) if end not in attached]
+            if invalid:
                 points = it[0].find("Points")
                 pts = [(p.get("X"), p.get("Y")) for p in (points if points is not None else [])]
-                out.append((key, pts[0] if pts else ("?", "?")))
+                out.append((key, pts[0] if pts else ("?", "?"), invalid))
         return out
 
     def graphic_groups(self):
@@ -137,13 +158,15 @@ class Circuit:
         connector_port = {}
         for sym in self.symbols.values():
             for pin_item in sym[0].findall("./Objects/Item[@Class='CIITPinSymbolComp']"):
-                conn = pin_item.find("./CIITPinSymbolComp/Objects/Item[@Class='CIITPinConnectorComp']")
+                conn = pin_item[0].find("./Objects/Item[@Class='CIITPinConnectorComp']")
                 if conn is not None:
                     connector_port[conn.get("ID")] = pin_item[0].get("PortID")
         for key, it in self.items.items():
             if it.get("Class") == "CODPinComp":
-                for link in it[0].find("ConnectList"):
-                    union(key, link.get("ID"))
+                clist = it[0].find("ConnectList")
+                if clist is not None:
+                    for link in clist:
+                        union(key, link.get("ID"))
         for w in self.wires.values():
             union(w[0].get("Connect1"), w[0].get("Connect2"))
         groups = defaultdict(set)
@@ -153,15 +176,20 @@ class Circuit:
         return list(groups.values())
 
 
-def check_file(path, expected: dict | None = None) -> dict:
-    root = xmlio.load(path)
-    c = Circuit(root)
+def check_root(root, expected: dict | None = None, source="<memory>") -> dict:
+    diagram = next(root.iter("CIITDiagram"), None)
+    if diagram is None:
+        raise ValueError(f"not a Multisim circuit: {source} has no CIITDiagram element")
+    c = Circuit(root, diagram=diagram)
     problems = []
     for name, count in sorted(c.refdes_counts().items()):
         if count > 1:
             problems.append(f"Reference designator {name} is used by {count} components; every component needs a unique one")
-    for key, point in c.dangling_wires():
-        problems.append(f"Wire {key} at {point[0]},{point[1]} is not attached to anything")
+    for key, point, invalid in c.dangling_wires():
+        if len(invalid) == 2:
+            problems.append(f"Wire {key} at {point[0]},{point[1]} is not attached to anything")
+        else:
+            problems.append(f"Wire {key} at {point[0]},{point[1]} has an unattached endpoint {invalid[0]}")
     nets = c.electrical_nets()
     port_net = {m: net for net, members in nets.items() for m in members}
     groups = c.graphic_groups()
@@ -171,16 +199,18 @@ def check_file(path, expected: dict | None = None) -> dict:
         if len(owners) > 1:
             problems.append(f"Wires connect different nets together: {sorted(members)} belong to {sorted(o or '?' for o in owners)}")
     connected = set().union(*groups) if groups else set()
+    visible = c.visible_pin_labels()
     for net, members in nets.items():
-        if net == "0" or len(members) < 2:
-            continue                              # a one-pin net is an unused pin, not a broken net
-        parts_ = [g for g in groups if g & members]
+        vis_members = members & visible
+        if net == "0" or len(vis_members) < 2:
+            continue                              # a one-visible-pin or hidden-only net has no schematic wire requirement
+        parts_ = [g for g in groups if g & vis_members]
         if not parts_:
-            problems.append(f"Net {net} has no wire at all on the diagram (pins {sorted(members)} are not connected to anything)")
+            problems.append(f"Net {net} has no wire at all on the diagram (pins {sorted(vis_members)} are not connected to anything)")
             continue
         if len(parts_) > 1:
             problems.append(f"Net {net} is split into {len(parts_)} pieces on the diagram: {[sorted(g) for g in parts_]}")
-        loose = sorted(members - connected)
+        loose = sorted(vis_members - connected)
         if loose:
             problems.append(f"Pins {loose} of net {net} are not attached to any wire")
     if expected:
@@ -191,14 +221,19 @@ def check_file(path, expected: dict | None = None) -> dict:
 
     # Layout
     warnings = []
-    diagram = next(root.iter("CIITDiagram"), None)
-    if diagram is None:
-        raise ValueError(f"not a Multisim circuit: {path} has no CIITDiagram element")
     width = float(diagram.get("PageWidth", "11")) * 96
     height = float(diagram.get("PageHeight", "8.5")) * 96
-    boxes = {}
+    # Prefer CIITSymbolComp over CIITAnimationSymbolComp if both represent one CiComponent.
+    sym_by_comp = {}
     for sym in c.symbols.values():
-        comp = c.comps.get(sym[0].get("CiComponent"))
+        cid = sym[0].get("CiComponent")
+        if not cid:
+            continue
+        if cid not in sym_by_comp or sym.get("Class") == "CIITSymbolComp":
+            sym_by_comp[cid] = sym
+    boxes = {}
+    for cid, sym in sym_by_comp.items():
+        comp = c.comps.get(cid)
         if comp is None:
             continue
         box = symbol_bbox(sym)
@@ -206,10 +241,15 @@ def check_file(path, expected: dict | None = None) -> dict:
             continue
         name = xmlio.unasc(comp[0].get("LocalName"))
         if name == "0":
-            name = f"GND@{box[0]:.0f},{box[1]:.0f}"
-        boxes[name] = box
+            base = f"GND@{box[0]:.0f},{box[1]:.0f}"
+        elif not name or name in boxes:
+            base = f"{name or 'PART'}@{box[0]:.0f},{box[1]:.0f}"
+        else:
+            base = name
+        key = base if base not in boxes else f"{base}#{cid}"
+        boxes[key] = box
         if box[0] < 0 or box[1] < 0 or box[2] > width or box[3] > height:
-            warnings.append(f"{name} is outside the sheet ({box[0]:.0f},{box[1]:.0f} – {box[2]:.0f},{box[3]:.0f}, sheet {width:.0f}×{height:.0f})")
+            warnings.append(f"{key} is outside the sheet ({box[0]:.0f},{box[1]:.0f} – {box[2]:.0f},{box[3]:.0f}, sheet {width:.0f}×{height:.0f})")
     names = sorted(boxes)
     for i, a in enumerate(names):
         for b in names[i + 1:]:
@@ -221,7 +261,8 @@ def check_file(path, expected: dict | None = None) -> dict:
     for w in c.wires.values():
         node = c.nodes.get(w[0].get("Node"))
         net = xmlio.unasc(node[0].get("LocalName")).lower() if node is not None else "?"
-        pts = [(float(p.get("X")), float(p.get("Y"))) for p in w[0].find("Points")]
+        points = w[0].find("Points")
+        pts = [(float(p.get("X")), float(p.get("Y"))) for p in (points if points is not None else [])]
         segs.extend((net, a, b) for a, b in zip(pts, pts[1:]))
     crossings, overlaps = 0, 0
     for i, (na, a, b) in enumerate(segs):
@@ -245,6 +286,10 @@ def check_file(path, expected: dict | None = None) -> dict:
         warnings.append(f"Wires of different nets cross in {crossings} places")
     return {"problems": problems, "warnings": warnings, "crossings": crossings,
             "nets": {k: sorted(v) for k, v in nets.items()}}
+
+
+def check_file(path, expected: dict | None = None) -> dict:
+    return check_root(xmlio.load(path), expected=expected, source=path)
 
 
 def _cross(a, b, p, q):
@@ -281,28 +326,34 @@ def inspect(path) -> dict:
     root = xmlio.load(path)
     c = Circuit(root)
     comps = []
+    _valued_parts = {
+        "RESISTOR_VIRTUAL", "CAPACITOR_VIRTUAL", "CAP_ELECTROLIT_VIRTUAL",
+        "INDUCTOR_VIRTUAL", "RESISTOR", "CAPACITOR", "INDUCTOR",
+        "DC_POWER", "DC_CURRENT", "AC_VOLTAGE",
+    }
     for it in c.comps.values():
         comp = it[0]
         ident = identity(comp)
         name = xmlio.unasc(comp.get("LocalName"))
-        if ident is None or name == "0":
+        if ident is None or name == "0" or ident[2] == "ground" or ident[1] == "POWER_SOURCES":
             continue
         plist = comp.find(".//CiaParamList")
         value = None
-        if plist is not None and ident[0] in ("RESISTOR_VIRTUAL", "CAPACITOR_VIRTUAL", "INDUCTOR_VIRTUAL", "DC_POWER"):
+        if plist is not None and (ident[0] in _valued_parts or ident[1] in ("RESISTORS_VIRTUAL", "CAPACITORS_VIRTUAL", "INDUCTORS_VIRTUAL")):
             params = plist.findall("./parameters/Item")
             value = xmlio.unasc(params[1].get("Value")) if len(params) > 1 else None
         comps.append({"refdes": name, "part": ident[0], "family": ident[1], "value": value})
     instruments = {}
     for node in root.iter("CSourceSymbolCollectNode"):
         long_name = xmlio.unasc(node.get("CompLongName") or "")
-        if "#" not in long_name:
+        if not long_name:
             continue
         settings = {}
         for el in node.iter("Element"):
             data = el.find("CDataElement")
             if data is not None and data.get("Data") not in (None, ""):
                 settings[xmlio.unasc(el.get("Key"))] = data.get("Data")
-        instruments[long_name.split("#")[0]] = settings
+        inst_key = long_name.split("#", 1)[0].split("/", 1)[0]
+        instruments[inst_key] = settings
     return {"components": sorted(comps, key=lambda d: d["refdes"]), "nets": {k: sorted(v) for k, v in c.electrical_nets().items()},
             "instruments": instruments}

@@ -57,7 +57,7 @@ def shell_from_blank(blank: Path) -> "xmlio.ET.Element":
             if node is not None:
                 xmlio.clear(node)
         break
-    for tag in ("InstrumentsData", "CIRToInfoMap", "TriggerSet"):
+    for tag in ("InstrumentsData", "CIRToInfoMap", "RefDesPrefixUsageMap", "TriggerSet"):
         for node in root.iter(tag):
             xmlio.clear(node)
     return root

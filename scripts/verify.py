@@ -6,6 +6,7 @@
 Prints a table of checks and exits non-zero if any offline check fails.
 """
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -27,7 +28,8 @@ def record(name, ok, detail=""):
 
 def run(argv):
     return subprocess.run([sys.executable, "-m", "multisimforge", *argv], cwd=str(ROOT),
-                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
 
 
 def offline():
@@ -119,8 +121,29 @@ def real():
             status = json.loads(out.stdout)
         except ValueError:
             status = {}
-        record("com worker", bool(status.get("running")) or "error" in status, json.dumps(status)[:100])
+        record("com worker", bool(status.get("running")), json.dumps(status)[:100])
         run(["com", "stop"])
+
+        # Real Multisim acceptance includes the actual GUI and PrintWindow snapshots.
+        # Do not treat a successful pure-Python test as proof of GUI functionality.
+        shots = tmp / "screenshots"
+        before = hashlib.sha256(Path(built["ms14"]).read_bytes()).hexdigest()
+        capture_run = run(["capture", str(built["ms14"]), str(shots), "--wait", "0.5", "--timeout", "40"])
+        try:
+            capture_result = json.loads(capture_run.stdout)
+        except ValueError:
+            capture_result = {"error": (capture_run.stderr or capture_run.stdout or "")[-300:]}
+        images = capture_result.get("images") or {}
+        record("native capture command", capture_run.returncode == 0,
+               f"status={capture_result.get('status')} {str(capture_result.get('error', ''))[:100]}")
+        for name in ("circuit", "montage"):
+            artifact = Path(images[name]) if name in images else None
+            record(f"native {name} image", bool(artifact and artifact.is_file() and artifact.stat().st_size > 500),
+                   str(artifact or "missing"))
+        record("native panel images",
+               any(key not in ("circuit", "montage", "screen") for key in images))
+        record("input hash unchanged by capture",
+               before == hashlib.sha256(Path(built["ms14"]).read_bytes()).hexdigest())
 
 
 def main():

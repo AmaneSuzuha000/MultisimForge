@@ -79,46 +79,95 @@ for _i in range(16):
         _LEN_TOKEN[LEN_BASE[_i] + _extra + 2] = (
             (_extra << (LEN_BITS[_i] + 1)) | (LEN_CODE[_i] << 1) | 1, LEN_BITS[_i] + EX_LEN_BITS[_i] + 1)
 _LIT_TOKEN = [(CH_CODE_ASC[b] << 1, CH_BITS_ASC[b] + 1) for b in range(256)]
+_DIST_TOKEN = [(DIST_CODE[d >> 6] | ((d & 0x3F) << DIST_BITS[d >> 6]), DIST_BITS[d >> 6] + 6) for d in range(WINDOW)]
+_U32 = struct.Struct("<I").unpack_from
 
 
-def explode(block: bytes) -> bytes:
-    """Decompress one DCL Implode data block."""
+def explode(block: bytes, *, max_output: int | None = None) -> bytes:
+    """Decompress one DCL Implode block, bounding actual output as it expands."""
+    if max_output is not None and max_output < 0:
+        raise ValueError("Declared section length cannot be negative")
+    if len(block) < 2:
+        raise ValueError("Corrupt compressed data: missing DCL header")
     ascii_lit, dict_bits = block[0], block[1]
     if ascii_lit > 1 or not 4 <= dict_bits <= 6:
         raise ValueError("Not DCL Implode data")
-    buf = bytes(block[2:]) + b"\0" * 8
+    bit_limit = (len(block) - 2) * 8
+    buf = bytes(block[2:]) + b"\x00" * 8
     out = bytearray()
+    out_append = out.append
+    lit_tbl = _LIT
+    len_tbl = _LEN
+    dist_tbl = _DIST
+    ex_bits = EX_LEN_BITS
+    len_base = LEN_BASE
+    unpack_u32 = _U32
+    dist_mask = (1 << dict_bits) - 1
     pos = 0
     while True:
-        v = int.from_bytes(buf[pos >> 3:(pos >> 3) + 4], "little") >> (pos & 7)
+        if pos >= bit_limit:
+            raise ValueError("Corrupt compressed data: missing end marker")
+        v = unpack_u32(buf, pos >> 3)[0] >> (pos & 7)
         if not v & 1:                                   # literal
+            if max_output is not None and len(out) >= max_output:
+                raise ValueError("Decompressed data exceeds declared section length")
             if ascii_lit:
-                sym, n = _LIT[(v >> 1) & 0x1FFF]
-                out.append(sym)
+                entry = lit_tbl[(v >> 1) & 0x1FFF]
+                if entry is None:
+                    raise ValueError("Corrupt compressed data: invalid literal code")
+                sym, n = entry
                 pos += 1 + n
+                if pos > bit_limit:
+                    raise ValueError("Corrupt compressed data: truncated literal")
+                out_append(sym)
             else:
-                out.append((v >> 1) & 0xFF)
                 pos += 9
+                if pos > bit_limit:
+                    raise ValueError("Corrupt compressed data: truncated literal")
+                out_append((v >> 1) & 0xFF)
             continue
-        i, n = _LEN[(v >> 1) & 0x7F]
-        e = EX_LEN_BITS[i]
-        length = LEN_BASE[i] + ((v >> (1 + n)) & ((1 << e) - 1)) + 2
+        entry = len_tbl[(v >> 1) & 0x7F]
+        if entry is None:
+            raise ValueError("Corrupt compressed data: invalid length code")
+        i, n = entry
+        e = ex_bits[i]
+        length = len_base[i] + ((v >> (1 + n)) & ((1 << e) - 1)) + 2
         pos += 1 + n + e
+        if pos > bit_limit:
+            raise ValueError("Corrupt compressed data: truncated length code")
         if length == 519:
             break
-        v = int.from_bytes(buf[pos >> 3:(pos >> 3) + 4], "little") >> (pos & 7)
-        hi, n = _DIST[v & 0xFF]
-        low_bits = 2 if length == 2 else dict_bits
-        dist = ((hi << low_bits) | ((v >> n) & ((1 << low_bits) - 1))) + 1
+        if max_output is not None and len(out) + length > max_output:
+            raise ValueError("Decompressed data exceeds declared section length")
+        if pos >= bit_limit:
+            raise ValueError("Corrupt compressed data: truncated back-reference")
+        v = unpack_u32(buf, pos >> 3)[0] >> (pos & 7)
+        entry = dist_tbl[v & 0xFF]
+        if entry is None:
+            raise ValueError("Corrupt compressed data: invalid distance code")
+        hi, n = entry
+        if length == 2:
+            low_bits, mask = 2, 3
+        else:
+            low_bits, mask = dict_bits, dist_mask
+        dist = ((hi << low_bits) | ((v >> n) & mask)) + 1
         pos += n + low_bits
+        if pos > bit_limit:
+            raise ValueError("Corrupt compressed data: truncated distance code")
         start = len(out) - dist
         if start < 0:
             raise ValueError("Corrupt compressed data: distance out of range")
         if dist >= length:
             out += out[start:start + length]
+        elif dist == 1:
+            out.extend(out[start:start + 1] * length)
         else:                                           # overlapping copy
-            for k in range(length):
-                out.append(out[start + k])
+            rem = length
+            while rem > 0:
+                take = dist if dist < rem else rem
+                cur = len(out) - dist
+                out += out[cur:cur + take]
+                rem -= take
     return bytes(out)
 
 
@@ -143,42 +192,76 @@ def _match_len(data, a, b, limit):
 def implode(data: bytes) -> bytes:
     """Greedy LZ77 compression into DCL Implode (ASCII literals, 4 KB dictionary)."""
     out = bytearray(b"\x01\x06")
+    out_append = out.append
+    lit_tok = _LIT_TOKEN
+    len_tok = _LEN_TOKEN
+    dist_tok = _DIST_TOKEN
     acc = nacc = 0
-
-    def put(code, n):
-        nonlocal acc, nacc
-        acc |= code << nacc
-        nacc += n
-        while nacc >= 8:
-            out.append(acc & 0xFF)
-            acc >>= 8
-            nacc -= 8
-
-    last = {}                       # 3-byte prefix → most recent position
+    last = {}                       # 24-bit trigram int -> most recent position
+    last_get = last.get
     n = len(data)
+    n2 = n - 2
     i = 0
     while i < n:
-        length = 0
         if i + 3 <= n:
-            key = data[i:i + 3]
-            c = last.get(key)
+            key = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2]
+            c = last_get(key)
             last[key] = i
             if c is not None and i - c <= WINDOW:
-                length = _match_len(data, c, i, min(MAX_LEN, n - i))
-        if length >= 3:
-            put(*_LEN_TOKEN[length])
-            d = i - c - 1
-            put(DIST_CODE[d >> 6], DIST_BITS[d >> 6])
-            put(d & 0x3F, 6)
-            for j in range(i + 1, min(i + length, n - 2)):
-                last[data[j:j + 3]] = j
-            i += length
-        else:
-            put(*_LIT_TOKEN[data[i]])
-            i += 1
-    put(*_LEN_TOKEN[519])
+                rem = n - i
+                limit = MAX_LEN if rem >= MAX_LEN else rem
+                if limit == 3 or data[c + 3] != data[i + 3]:
+                    length = 3
+                else:
+                    lo, step = 4, 8
+                    while lo < limit:
+                        hi = lo + step
+                        if hi > limit:
+                            hi = limit
+                        if data[c + lo:c + hi] == data[i + lo:i + hi]:
+                            lo = hi
+                            step <<= 1
+                        else:
+                            while hi - lo > 1:
+                                mid = (lo + hi) >> 1
+                                if data[c + lo:c + mid] == data[i + lo:i + mid]:
+                                    lo = mid
+                                else:
+                                    hi = mid
+                            break
+                    length = lo
+                lc, ln = len_tok[length]
+                dc, dn = dist_tok[i - c - 1]
+                acc |= (lc | (dc << ln)) << nacc
+                nacc += ln + dn
+                while nacc >= 8:
+                    out_append(acc & 0xFF)
+                    acc >>= 8
+                    nacc -= 8
+                end_j = i + length
+                if end_j > n2:
+                    end_j = n2
+                for j in range(i + 1, end_j):
+                    last[(data[j] << 16) | (data[j + 1] << 8) | data[j + 2]] = j
+                i += length
+                continue
+        c_lit, n_lit = lit_tok[data[i]]
+        acc |= c_lit << nacc
+        nacc += n_lit
+        while nacc >= 8:
+            out_append(acc & 0xFF)
+            acc >>= 8
+            nacc -= 8
+        i += 1
+    lc, ln = len_tok[519]
+    acc |= lc << nacc
+    nacc += ln
+    while nacc >= 8:
+        out_append(acc & 0xFF)
+        acc >>= 8
+        nacc -= 8
     if nacc:
-        out.append(acc & 0xFF)
+        out_append(acc & 0xFF)
     return bytes(out)
 
 
@@ -204,11 +287,11 @@ def decode(data: bytes, *, max_bytes: int = MAX_FILE, max_section: int = MAX_SEC
             raise ValueError("corrupt .ms14: a section header is truncated")
         raw_len, comp_len = struct.unpack_from("<II", data, pos)
         pos += 8
-        if raw_len > max_section:
-            raise ValueError(f"corrupt or oversized .ms14: a section declares {raw_len} bytes, the limit is {max_section}")
+        if raw_len == 0 or raw_len > max_section or size + raw_len > total:
+            raise ValueError(f"corrupt or oversized .ms14: invalid section length {raw_len} (limit {max_section}, remaining {total - size})")
         if comp_len > len(data) - pos:
             raise ValueError("corrupt .ms14: a section is longer than the file")
-        part = explode(data[pos:pos + comp_len])
+        part = explode(data[pos:pos + comp_len], max_output=raw_len)
         if len(part) != raw_len:
             raise ValueError(f"Section length mismatch: expected {raw_len}, got {len(part)}")
         parts.append(part)

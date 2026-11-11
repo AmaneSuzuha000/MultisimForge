@@ -145,10 +145,14 @@ def cmd_sim(a):
     ac = None
     if a.ac:
         v = _floats(a.ac, (2, 3))
+        if v[0] <= 0 or v[1] <= v[0] or (len(v) > 2 and (v[2] < 1 or not v[2].is_integer())):
+            raise ValueError("AC sweep requires 0 < start < stop and a positive integer points-per-decade")
         ac = (v[0], v[1], int(v[2]) if len(v) > 2 else 100)
     tran = None
     if a.tran:
         v = _floats(a.tran, (1, 2))
+        if v[0] <= 0 or (len(v) > 1 and v[1] <= 0):
+            raise ValueError("transient duration and optional sample rate must be positive")
         tran = (v[0], v[1] if len(v) > 1 else None)
     if not (a.op or ac or tran):
         raise ValueError("choose at least one analysis: --op / --ac / --tran")
@@ -177,10 +181,23 @@ def sim_status(payload: dict, require_vectors: bool = False):
     return Status.WARN if payload.get("warnings") else Status.PASS
 
 
+def cmd_sections(a):
+    """Read-only native enumeration of sections already placed in one package."""
+    from . import com
+    return com.call({"op": "sections", "ms14": str(Path(a.ms14).resolve()), "ref": a.ref}), Status.PASS
+
+
+def cmd_cursors(a):
+    """Numerical cursor readouts from original simulator CSV (not Multisim GUI cursors)."""
+    from .measure import measure_csv
+    from .netlist import parse_value
+    return measure_csv(a.csv, a.column, parse_value(a.x1), parse_value(a.x2), axis=a.axis), Status.PASS
+
+
 def cmd_capture(a):
     from . import capture
     r = capture.capture(a.ms14, a.outdir, wait=a.wait, timeout=a.timeout, keep_open=a.keep_open,
-                        on_netlist_error=a.on_netlist_error)
+                        on_netlist_error=a.on_netlist_error, desktop_screen=a.desktop_screen)
     return r, (Status.WARN if r.get("warnings") else Status.PASS)
 
 
@@ -262,12 +279,26 @@ def main(argv=None):
     s.add_argument("--cmd", action="append", required=True, help='analysis command, e.g. "tran 1u 10m"; may be repeated')
     s.set_defaults(func=cmd_spice)
 
-    s = sub.add_parser("capture", help="open Multisim, run the simulation, and capture the circuit, instrument panels, and full screen")
+    s = sub.add_parser("sections", help="read-only Multisim EnumSections query for a package refdes (native COM)")
+    s.add_argument("ms14")
+    s.add_argument("ref", help="package reference designator, e.g. U1")
+    s.set_defaults(func=cmd_sections)
+
+    s = sub.add_parser("cursors", help="virtual numerical cursors measured from simulator CSV; no GUI cursor preset")
+    s.add_argument("csv", help="AC or transient CSV exported by sim")
+    s.add_argument("--column", required=True, help="data column to measure, e.g. vout or vout_mag")
+    s.add_argument("--x1", required=True, help="first cursor x-coordinate, supports units")
+    s.add_argument("--x2", required=True, help="second cursor x-coordinate, supports units")
+    s.add_argument("--axis", choices=["auto", "linear", "log"], default="auto")
+    s.set_defaults(func=cmd_cursors)
+
+    s = sub.add_parser("capture", help="open Multisim, run the simulation, and capture the circuit and instrument panels")
     s.add_argument("ms14")
     s.add_argument("outdir")
     s.add_argument("--wait", type=_positive, default=1.5, help="how long the display must be still to consider the simulation finished (seconds)")
     s.add_argument("--timeout", type=_positive, default=90, help="maximum wait (seconds)")
     s.add_argument("--keep-open", action="store_true", help="do not close Multisim after capturing")
+    s.add_argument("--desktop-screen", action="store_true", help="opt into real desktop capture requiring foreground; default is PrintWindow montage")
     s.add_argument("--on-netlist-error", choices=["abort", "continue"], default="abort",
                    help="what to do when Multisim reports a netlist error (default: abort and fail)")
     s.set_defaults(func=cmd_capture)

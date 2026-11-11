@@ -14,6 +14,7 @@ Supported lines:
 Comments start with *, .end and other dot commands are ignored; a line starting with + continues the previous one.
 Net names are case-insensitive; 0 and gnd are both ground.
 """
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -46,7 +47,10 @@ def parse_value(token) -> float:
      typo such as 1kgarbage or 4.7kjunk is rejected instead of silently becoming 1k.
     """
     if isinstance(token, (int, float)):
-        return float(token)
+        value = float(token)
+        if not math.isfinite(value):
+            raise ValueError(f"cannot parse non-finite value {token!r}")
+        return value
     text = str(token).strip()
     m = _RKM.match(text)
     if m:
@@ -54,18 +58,26 @@ def parse_value(token) -> float:
         if unit.lower() not in _UNITS:
             raise ValueError(f"cannot parse value {token!r}")
         scale = 1e6 if mult == "M" else SUFFIX[mult.lower()]
-        return float(f"{whole}.{frac}") * scale
+        value = float(f"{whole}.{frac}") * scale
+        if not math.isfinite(value):
+            raise ValueError(f"cannot parse non-finite value {token!r}")
+        return value
     m = _NUM.match(text)
     if not m:
         raise ValueError(f"cannot parse value {token!r}")
     number, mult, unit = m.group(1), m.group(2) or "", m.group(3)
     if unit.lower() not in _UNITS:
         raise ValueError(f"cannot parse value {token!r}")
-    return float(number) * (1e6 if mult == "M" else SUFFIX[mult.lower()])
+    value = float(number) * (1e6 if mult == "M" else SUFFIX[mult.lower()])
+    if not math.isfinite(value):
+        raise ValueError(f"cannot parse non-finite value {token!r}")
+    return value
 
 
 def net_name(token: str) -> str:
     t = token.strip()
+    if not t:
+        raise ValueError("empty net name")
     return "0" if t.lower() in ("0", "gnd") else t.lower()
 
 
@@ -103,10 +115,14 @@ def _source(rest: str, refdes: str) -> dict:
         args = [parse_value(a) for a in m.group(1).replace(",", " ").split()]
         if len(args) < 3:
             raise ValueError(f"{refdes}: SIN needs at least (offset peak frequency)")
+        if len(args) > 6:
+            raise ValueError(f"{refdes}: SIN accepts at most 6 parameters (offset peak frequency [delay damping phase])")
         out.update(type="sin", offset=args[0], amplitude=args[1], freq=args[2],
                    delay=args[3] if len(args) > 3 else 0.0, damping=args[4] if len(args) > 4 else 0.0,
                    phase=args[5] if len(args) > 5 else 0.0)
         text = text[:m.start()] + text[m.end():]
+        if re.search(r"(?i)\bsin\s*\(", text):
+            raise ValueError(f"{refdes}: duplicate SIN specification")
     m = re.search(r"(?i)\bpulse\s*\(([^)]*)\)", text)
     if m:
         args = [parse_value(a) for a in m.group(1).replace(",", " ").split()]
@@ -114,20 +130,32 @@ def _source(rest: str, refdes: str) -> dict:
             raise ValueError(f"{refdes}: PULSE needs 7 parameters (low high delay rise fall width period)")
         out.update(type="pulse", pulse=args)
         text = text[:m.start()] + text[m.end():]
-    m = re.search(r"(?i)\bac\s+(\S+)(?:\s+([+-]?[\d.]+))?", text)
+        if re.search(r"(?i)\bpulse\s*\(", text):
+            raise ValueError(f"{refdes}: duplicate PULSE specification")
+    m = re.search(r"(?i)\bac\s+(\S+)(?:\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)))?", text)
     if m:
-        out["ac"] = (parse_value(m.group(1)), float(m.group(2)) if m.group(2) else 0.0)
+        phase = float(m.group(2)) if m.group(2) else 0.0
+        if not math.isfinite(phase):
+            raise ValueError(f"{refdes}: AC phase must be finite")
+        out["ac"] = (parse_value(m.group(1)), phase)
         text = text[:m.start()] + text[m.end():]
+        if re.search(r"(?i)\bac\s+\S+", text):
+            raise ValueError(f"{refdes}: duplicate AC specification")
     m = re.search(r"(?i)\bdc\s+(\S+)", text)
     if m:
         out["dc"] = parse_value(m.group(1))
         text = text[:m.start()] + text[m.end():]
+        if re.search(r"(?i)\bdc\s+\S+", text):
+            raise ValueError(f"{refdes}: duplicate DC specification")
     leftover = text.split()
     if leftover and out["type"] == "dc" and len(leftover) == 1:
         out["dc"] = parse_value(leftover[0])      # V1 a 0 12
     elif leftover:
         raise ValueError(f"{refdes}: unrecognised source parameter {' '.join(leftover)!r}")
     return out
+
+
+_INST_REF = re.compile(r"^(?:XSC|XFG|XBP|XMM)\d*$")
 
 
 def parse(text: str) -> list[Instance]:
@@ -143,7 +171,11 @@ def parse(text: str) -> list[Instance]:
         seen.add(key)
         inst = Instance(refdes=ref, part="", line=line)
         prefix3 = key[:3]
-        if prefix3 in INSTRUMENTS:
+        is_instrument = prefix3 in INSTRUMENTS and (
+            _INST_REF.match(key) is not None
+            or any(t.upper() in INSTRUMENTS[prefix3][0] for t in tokens[1:])
+        )
+        if is_instrument:
             keywords, part = INSTRUMENTS[prefix3]
             idx = next((i for i, t in enumerate(tokens) if t.upper() in keywords), None)
             if idx is None:
@@ -165,9 +197,13 @@ def parse(text: str) -> list[Instance]:
             inst.nets = [net_name(t) for t in tokens[1:3]]
             inst.value = tokens[3]
             parse_value(inst.value)
+            if len(tokens) > 5:
+                raise ValueError(f"{ref}: unexpected trailing tokens after explicit part name")
             if len(tokens) > 4:
                 inst.part = tokens[4]          # explicit library part, e.g. an electrolytic capacitor
         elif key[0] in "VI":
+            if len(tokens) < 4:
+                raise ValueError(f"{ref}: write {ref} node1 node2 source")
             inst.nets = [net_name(t) for t in tokens[1:3]]
             inst.source = _source(" ".join(tokens[3:]), ref)
             kind = inst.source["type"]
@@ -196,6 +232,11 @@ def parse(text: str) -> list[Instance]:
                 for t in body:
                     if "=" in t:
                         pin, _, net = t.partition("=")
+                        pin = pin.strip()
+                        if not pin or not net.strip():
+                            raise ValueError(f"{ref}: invalid pin=net assignment {t!r}")
+                        if pin in inst.named:
+                            raise ValueError(f"{ref}: duplicate assignment for pin {pin!r}")
                         inst.named[pin] = net_name(net)
             else:
                 if len(body) < 2:

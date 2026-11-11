@@ -13,6 +13,7 @@ from pathlib import Path
 from . import codec
 
 _ATTR = re.compile(r'''(=\s*)(["'])(.*?)\2''', re.DOTALL)
+_TAG = re.compile(r'''<[A-Za-z_][\w.:-]*\s+(?:[^<>"']|"[^"]*"|'[^']*')+?>''')
 
 
 def _preserve(match):
@@ -20,10 +21,17 @@ def _preserve(match):
     return match[1] + match[2] + value + match[2]
 
 
+def _preserve_tag(match):
+    tag = match.group(0)
+    if "\n" not in tag and "\r" not in tag and "\t" not in tag:
+        return tag
+    return _ATTR.sub(_preserve, tag)
+
+
 def parse_text(text: str) -> ET.Element:
     # a few official examples have a NUL at the end of base64 attributes; XML does not allow it, and removing it does not affect the content
     text = text.replace("\x00", "")
-    return ET.fromstring(_ATTR.sub(_preserve, text))
+    return ET.fromstring(_TAG.sub(_preserve_tag, text))
 
 
 def _esc_attr(value: str) -> str:
@@ -114,7 +122,7 @@ def decode_uc(text: str) -> str:
         if n == 0 or len(hexes) < 4 * n or any(c not in "0123456789abcdefABCDEF" for c in hexes):
             continue
         out.append(text[i:m.start()])
-        out.append("".join(chr(int(hexes[k:k + 4], 16)) for k in range(0, 4 * n, 4)))
+        out.append(bytes.fromhex(hexes).decode("utf-16-be", errors="replace"))
         i = m.end() + 4 * n
     out.append(text[i:])
     return "".join(out)
@@ -129,7 +137,7 @@ def text(value: str) -> str:
 
 
 def uni(value: str) -> str:
-    """Plain text → attribute string: pure ASCII uses &ASC; otherwise &UNI with consecutive non-ASCII characters escaped in groups of at most 9."""
+    """Plain text → attribute string: pure ASCII uses &ASC; otherwise &UNI with consecutive non-ASCII UTF-16 units escaped in groups of at most 9."""
     if all(ord(ch) < 128 for ch in value):
         return asc(value)
     out, run = [], []
@@ -138,15 +146,33 @@ def uni(value: str) -> str:
         while run:
             chunk = run[:9]
             del run[:9]
-            out.append(f"_uc{len(chunk)}" + "".join(f"{ord(ch):04x}" for ch in chunk))
+            out.append(f"_uc{len(chunk)}" + "".join(f"{u:04x}" for u in chunk))
     for ch in value:
-        if ord(ch) < 128:
+        code = ord(ch)
+        if code < 128:
             flush()
             out.append(ch)
+        elif code <= 0xFFFF:
+            run.append(code)
         else:
-            run.append(ch)
+            raw = ch.encode("utf-16-be")
+            run.append((raw[0] << 8) | raw[1])
+            run.append((raw[2] << 8) | raw[3])
     flush()
     return "&UNI" + "".join(out)
+
+
+def max_id(root: ET.Element, default: int = 0) -> int:
+    """Largest positive integer ID/CiID present anywhere in *root*."""
+    hi = default
+    for el in root.iter():
+        for attr in ID_ATTRS:
+            val = el.get(attr)
+            if val and val.isascii() and val.isdigit():
+                n = int(val)
+                if n > hi:
+                    hi = n
+    return hi
 
 
 def clear(element: ET.Element) -> None:

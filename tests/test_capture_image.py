@@ -6,6 +6,9 @@ with a known answer is a stronger test than a real screenshot, whose answer nobo
 import pytest
 
 PIL = pytest.importorskip("PIL")
+pytest.importorskip("numpy")
+pytest.importorskip("scipy")
+pytest.importorskip("win32api")
 from PIL import Image, ImageDraw  # noqa: E402
 
 from multisimforge import capture  # noqa: E402

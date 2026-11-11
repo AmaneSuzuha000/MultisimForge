@@ -21,6 +21,21 @@ def run(argv, monkeypatch, capsys):
     return code, json.loads(capsys.readouterr().out.strip())
 
 
+def test_native_section_query_is_read_only_and_reports_the_result(monkeypatch, capsys):
+    from multisimforge import com
+    calls = []
+
+    def fake(job):
+        calls.append(job)
+        return {"ref": job["ref"], "sections": ["A", "B"]}
+
+    monkeypatch.setattr(com, "call", fake)
+    code, result = run(["sections", "unimportant.ms14", "U1"], monkeypatch, capsys)
+    assert code == 0
+    assert result["sections"] == ["A", "B"]
+    assert calls[0]["op"] == "sections"
+
+
 def test_positive_rejects_zero_and_negative(monkeypatch):
     import argparse
     for text in ("0", "-1", "-0.5"):

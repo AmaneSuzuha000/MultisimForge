@@ -95,3 +95,34 @@ def test_unreachable_daemon_still_falls_back(monkeypatch):
         com._request({"op": "ping"}, 0.2)
     assert calls == [{"op": "ping"}], "an unreachable daemon gets one attempt before it is restarted"
     assert started, "restarting the daemon is the correct response to a dead one"
+
+
+def test_completed_daemon_error_must_not_be_replayed(monkeypatch):
+    monkeypatch.setattr(com, "_read_state", lambda: {"port": 123, "token": "x"})
+    monkeypatch.setattr(com, "_roundtrip", lambda *a: (_ for _ in ()).throw(com.ComError("unknown node")))
+    monkeypatch.setattr(com, "_oneshot", lambda *a: pytest.fail("must not replay"))
+    monkeypatch.setattr(com, "Popen", lambda *a, **k: pytest.fail("must not restart"))
+    with pytest.raises(com.ComError, match="unknown node"):
+        com.call({"op": "analyze"}, timeout=1)
+
+
+def test_connection_reset_after_submission_is_indeterminate(monkeypatch):
+    class BrokenSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def settimeout(self, value):
+            pass
+
+        def sendall(self, data):
+            pass
+
+        def recv(self, length):
+            raise ConnectionResetError("reset")
+
+    monkeypatch.setattr(com.socket, "create_connection", lambda *a, **k: BrokenSocket())
+    with pytest.raises(com.JobIndeterminate, match="after request submission"):
+        com._roundtrip({"port": 9, "token": "x"}, {"op": "analyze"}, 1)

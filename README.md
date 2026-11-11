@@ -25,7 +25,7 @@ MultisimForge treats a `.ms14` file as an XML container: it implements the conta
 - **Offline self-check**: reconstructs pin groups from wire and junction geometry and compares them against the electrical nets; also reports overlapping parts, wires crossing parts, crossings between different nets, and parts outside the sheet. No Multisim involved, so it cannot crash.
 - **Any part**: part templates are harvested whole from a `.ms14` (electrical part + ports + model + symbol + panel state). Simulation uses the part's own model.
 - **Real simulation data**: injects voltage probes on the nets you ask for, then drives DC operating point, AC sweep and transient analysis through COM — resonance peak, −3 dB frequency, phase, peak-to-peak, period. Arbitrary SPICE text can also be handed to Multisim's command-line engine.
-- **Real screenshots**: opens Multisim, runs the simulation, waits for the waveform to settle, then grabs the circuit window, each instrument panel and the full screen. If the scope trace does not fill the screen, the simulation time is recalibrated and the run repeats.
+- **Real screenshots**: opens Multisim, runs the simulation, waits for the waveform to settle, then grabs the circuit window, each instrument panel and a labelled `PrintWindow` montage (or the full screen with `--desktop-screen`). If the scope trace does not fill the screen, the simulation time is recalibrated and the run repeats.
 - **Reused COM instance**: `preview` / `sim` / `parts fetch` share one hidden Multisim inside a background 32-bit worker — roughly 0.3 s for the second call, with no repeated launch/kill cycle. `multisimforge com status` / `com stop` inspect and release it.
 - **Read existing designs**: `inspect` reports parts, nets and instrument settings.
 - **`.ms14` codec in pure Python**: decoded XML matches the vendor decoder, and the XML layer round-trips byte for byte.
@@ -148,9 +148,11 @@ Every segment must be horizontal or vertical, and polyline endpoints must land o
 | `preview x.ms14 x.png` | export the schematic through Multisim |
 | `check x.ms14` | offline self-check |
 | `inspect x.ms14` | report parts, nets, instrument settings |
+| `sections x.ms14 <ref>` | read-only native `EnumSections` query for a package |
 | `sim x.ms14 --nets a,b --op / --ac ... / --tran ...` | real simulation data |
+| `cursors file.csv --column c --x1 a --x2 b` | numerical cursor interpolation from simulator CSV |
 | `spice x.cir --cmd "tran 1u 10m"` | hand SPICE text to Multisim's engine |
-| `capture x.ms14 outdir` | real screenshots: circuit, each instrument panel, full screen (needs no other window open for that file name) |
+| `capture x.ms14 outdir` | real screenshots: circuit, each instrument panel, labelled montage (`--desktop-screen` for full screen) |
 | `set-sim-time x.ms14 20ms` | change the interactive simulation stop time |
 | `com status / stop` | inspect or release the background COM worker |
 | `decode / encode` | `.ms14` ↔ XML (debugging) |
@@ -168,10 +170,12 @@ Every segment must be horizontal or vertical, and polyline endpoints must land o
 | | `--out` / `--in` | AC output node / AC input source |
 | | `--at t1,t2,...` | time points to sample from a transient run |
 | | `--csv <dir>` | also write each analysis to CSV |
+| `cursors` | `--column / --x1 / --x2 / --axis` | column name, bounds (supports units), and `auto`/`linear`/`log` axis |
 | `spice` | `--cmd "tran 1u 10m"` | SPICE command handed to Multisim's engine |
 | `capture` | `--wait <s>` | how long the display must be still to call it finished (default 1.5) |
 | | `--timeout <s>` | maximum wait (default 90) |
 | | `--keep-open` | leave the window open after capture |
+| | `--desktop-screen` | opt into full-screen capture requiring foreground (default: PrintWindow montage) |
 | | `--on-netlist-error continue` | continue past the netlist-error dialog (default: abort) |
 | any | `--debug` | show the traceback instead of a JSON envelope on an unexpected error |
 
@@ -179,7 +183,7 @@ Durations must be greater than 0 and at most 3600 seconds.
 
 ## MCP server
 
-`mcp_adapter/server.py` is a stdio MCP server exposing the CLI as tools (`check_design`, `inspect_design`, `build_schematic`, `capture_instruments`, `simulate`, `preview_design`, `set_sim_time`, `convert_design`, `parts`, `run_cli`).
+`mcp_adapter/server.py` is a stdio MCP server exposing the CLI as tools (`runtime_status`, `check_design`, `inspect_design`, `list_sections`, `cursor_readings`, `build_schematic`, `capture_instruments`, `simulate`, `preview_design`, `set_sim_time`, `convert_design`, `parts`, `run_cli`).
 
 It is deliberately a **thin, process-isolated shell**: every tool shells out to `python -m multisimforge <cmd>` and returns the JSON the CLI prints. No Multisim COM object ever lives in the server process, so a COM crash or a failed screenshot run cannot take the server down.
 
@@ -193,7 +197,7 @@ python mcp_adapter/server.py          # stdio; let your MCP client launch it
 ## Layout
 
 ```text
-MultisimForge/
+multisimforge/
   codec.py        .ms14 container codec (PKWare DCL implode/explode, pure Python)
   xmlio.py        XML read/write (attribute newlines preserved, &ASC encoding, ID remapping)
   parts.py        part template library: harvest, index, lookup
@@ -203,8 +207,11 @@ MultisimForge/
   router.py       pin escape + obstacle-aware orthogonal A* + tree connection
   check.py        offline self-check: geometry → electrical nets, plus layout checks
   sim.py          real simulation (probe injection, OP/AC/TRAN, result statistics)
+  measure.py      data-driven numerical cursor interpolation on simulator CSVs
   capture.py      real screenshots (PrintWindow, F5/F7 key posting, waveform coverage)
+  imaging.py      labelled PrintWindow contact-sheet montage builder
   com.py          COM worker (one reused Multisim instance)
+  access.py       MCP path confinement & read-only escape-hatch policy
   config.py       local path detection
 mcp_adapter/      stdio MCP server + debug client
 tools/dbindex.js  read the Multisim master component database index (optional)
@@ -219,31 +226,74 @@ python -m pytest -q
 
 The offline suite covers the container codec, XML round-trips, the netlist parser, generation and connectivity of the three examples, and argument validation for mirroring and explicit wiring. CI runs on Windows and Linux (Linux runs only the parts that do not need Multisim).
 
+## Readouts and screenshots without foreground access
+
+Multisim 14.3 discards saved scope/Bode cursor positions on open. This is a vendor
+GUI limitation, **not** an excuse to fabricate readings. Use `sim --csv data/`
+and then measure two numerical cursors from the **real** simulator CSV:
+
+```powershell
+multisimforge sim out/rc.ms14 --nets vin,vout --tran 10m --csv work/data
+multisimforge cursors work/data/tran.csv --column vout --x1 1ms --x2 3ms
+multisimforge sim out/rc.ms14 --ac 10,100k --out vout --in vin --csv work/ac
+multisimforge cursors work/ac/ac.csv --column vout_mag --x1 1k --x2 10k
+```
+
+Numerical cursors interpolate inside the measured interval (linear in time, log
+in frequency); phase columns are unwrapped first. Returned results carry
+`not_gui_cursors: true`, raw CSV path, cursor coordinates and differences.
+
+`capture` now saves an explicitly labelled `*_montage.png` contact sheet
+assembled from real `PrintWindow` bitmaps plus each original instrument image.
+It needs no explicit foreground-grab step, and is **not a desktop screenshot**. Launching Multisim itself may still activate its window on some Windows desktops. If a
+genuine desktop view is needed, opt in with `capture ... --desktop-screen`; that
+specific option still requires foreground and should be run unattended.
+
+### MCP write safety
+
+Agent-side MCP writes are restricted to `work/` by default; to use a different
+workspace, set `MULTISIMFORGE_MCP_OUTPUT_ROOT` to its directory. This applies
+to build/preview/capture/CSV/convert destinations and in-place `set_sim_time`.
+The `run_cli` escape hatch is read-only (`check`, `inspect`, `cursors`).
+Mutating part-library actions require the explicit
+`MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES=1` environment setting. The direct
+local CLI remains available for trusted manual maintenance.
+
+## Native acceptance
+
+The public CI matrix is offline and does not contain licensed Multisim. On an
+authorised Windows worker with an interactive desktop, run
+`python scripts/verify.py --real`. Native acceptance now checks real AC data,
+the COM worker, live circuit/instrument images, the PrintWindow montage, and
+the preservation of the original circuit file's SHA-256. The manually triggered
+`native` GitHub job runs the same gate. A skipped native job is **not** a pass.
+
 ## Known limitations
 
-- **Scope and bode cursors cannot be preset.** The design file does carry the cursor
-  positions (`NI_EWB_CURRENTDISPLAYDATA_CURSORPOS_0/1`), and they survive a save, but
-  Multisim 14.3 ignores the stored value when it opens the design: a file written with
-  T1 = 1.5 ms, T2 = 3 ms opens with both cursors at 0 s, and requesting a restore through
-  `NI_EWB_HASSERIALIZERESTOREDATA` changes nothing. Take readings from `sim`, which
-  asks the simulator instead of the screen.
-- **Multi-section parts (LM324, 74LS00, ...) use only section A per instance**, and digital
-  parts keep VCC/GND on hidden pins. The generator writes one symbol per instance.
-- **Routing is automatic A*,** so dense circuits can still detour — move coordinates or
-  switch to `wires`; the `crossings` count is the metric to optimise. When a layout has no
-  legal route at all, the build fails and names the nets rather than shipping a drawing with
-  wires through parts. Overlapping parts are the usual cause, and the only fix is to move a
-  part, so auto-repair reports every move it makes.
-- **`parts fetch` can crash Multisim.** ReplaceComponent occasionally corrupts the
-  process heap (0xC0000374) and Multisim exits. It depends on the state of the running
-  instance rather than on the carrier circuit — the same fetch failed twice and then
-  succeeded three times in a row after the instance was restarted. A crash now restarts the
-  COM instance and retries once before reporting.
-- **`capture` takes the foreground for the desktop screenshot.** The circuit and panel
-  images come from `PrintWindow` and work with Multisim covered, but the full-screen image
-  composites the real desktop, so it needs Multisim on top: leave the mouse and keyboard
-  alone for about a minute. If the foreground cannot be taken, that one image is skipped
-  with a warning and the others are still written.
+- **Multisim 14.3 does not restore GUI cursor positions.** Numerical CSV cursor
+  readouts solve the measurement workflow but do not move native GUI cursors.
+- **Multi-section parts such as LM324 and 74LS00:** use
+  `multisimforge sections design.ms14 U1` (or the MCP `list_sections` tool)
+  to query which sections a native Multisim package already contains.
+  This read-only API does not construct additional sections. A harvested template places
+  only section A. Builds now report an explicit warning for parts with
+  `sections > 1`; separate instances do not share a physical IC package.
+  Full section-aware model reconstruction remains unverified and must be tested
+  on native Multisim samples before implementation.
+- **Dense routing:** multi-pass A* and layout repair are best-effort; some layouts
+  have no clean route under the supplied positions. Use explicit `wires` or
+  adjust the layout. The build fails instead of silently drawing through parts.
+  Automatic layout moves are reported in `moved_parts`.
+- **Multisim ReplaceComponent can crash with 0xC0000374.** The issue is inside
+  the vendor process and cannot be conclusively eliminated by Python changes.
+  The fetch implementation retries recognized crashes once; users should save
+  independent work before fetching. Native stress testing is still required.
+- **Unmodified desktop screenshots need foreground.** Default `capture` avoids
+  this with PrintWindow raw images and an explicitly labelled composite;
+  `--desktop-screen` is the opt-in real desktop capture.
+- **Real-native integration and GUI lifecycle remain Windows-only.** Linux can
+  run the offline codec/netlist/checker where dependencies permit, but cannot
+  replace a licensed Windows Multisim installation.
 
 ## License
 

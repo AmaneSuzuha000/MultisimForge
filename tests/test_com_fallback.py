@@ -140,3 +140,10 @@ def test_call_falls_back_when_the_daemon_is_unreachable(monkeypatch):
     monkeypatch.setattr(com, "_request", lambda job, timeout: (_ for _ in ()).throw(ConnectionRefusedError()))
     monkeypatch.setattr(com, "_oneshot", lambda job, timeout: {"ok": True})
     assert com.call({"op": "ping"}, 5) == {"ok": True}
+
+
+def test_oneshot_cannot_claim_success_after_nonzero_exit(monkeypatch):
+    monkeypatch.setattr(com.subprocess, "run",
+                        lambda *a, **k: Proc(stdout=json.dumps({"ok": True}), returncode=1))
+    with pytest.raises(com.ComError, match="worker exited 1"):
+        com._oneshot({"op": "analyze"}, 2)

@@ -14,7 +14,6 @@ spec fields:
     sheet        sheet size [width, height] in inches; defaults to a tight fit around the circuit
 """
 import hashlib
-import json
 import math
 import os
 import re
@@ -144,9 +143,13 @@ def apply_value(inst: nl.Instance, comp, kind: str) -> str | None:
 # Geometry
 # ---------------------------------------------------------------------------
 def _transform(el, x, y, translation=True):
-    g = lambda k, d: float(el.get("Transformer-" + k, d))
-    return (x * g("M00", "1") + y * g("M10", "0") + (g("M20", "0") if translation else 0),
-            x * g("M01", "0") + y * g("M11", "1") + (g("M21", "0") if translation else 0))
+    m00 = float(el.get("Transformer-M00", "1"))
+    m01 = float(el.get("Transformer-M01", "0"))
+    m10 = float(el.get("Transformer-M10", "0"))
+    m11 = float(el.get("Transformer-M11", "1"))
+    m20 = float(el.get("Transformer-M20", "0")) if translation else 0.0
+    m21 = float(el.get("Transformer-M21", "0")) if translation else 0.0
+    return x * m00 + y * m10 + m20, x * m01 + y * m11 + m21
 
 
 def pin_info(sym_item) -> dict:
@@ -293,13 +296,20 @@ def _find_main(root):
     raise ValueError("the circuit shell has no main schematic")
 
 
+def _refdes_str_size(raw_decoded: str) -> str:
+    """Packed C++ string size used in CIITHierRefDes (each '!0' maps to a NUL byte, plus 2 header bytes)."""
+    return str(len(raw_decoded.replace("!0", "\x00")) + 2)
+
+
 def _refdes_info(refdes, file_path, stem, template=None):
     """RefDes record: multi-section parts copy the harvested one (it carries the pin order), everything else is created in the same format."""
     m = re.fullmatch(r"([A-Za-z]+)(\d+)", refdes)
     if not m:
         return None
     prefix, num = m.groups()
-    text = f"&ASC!0!0!0{refdes}!0{file_path}!01!0{stem}!0"
+    raw_decoded = f"!0!0!0{refdes}!0{file_path}!01!0{stem}!0"
+    text = xmlio.asc(raw_decoded)
+    str_size = _refdes_str_size(raw_decoded)
     if template is not None:
         item = xmlio.deepcopy(template)
         section = xmlio.unasc(item.find("RefDesInfo").get("IRSection"))
@@ -309,22 +319,71 @@ def _refdes_info(refdes, file_path, stem, template=None):
         info.set("IRNumber", num)
         data = info.find("RefDesInfoData")
         data.set("RefDes", text)
-        data.set("RefDesStrSize", str(len(text)))
+        data.set("RefDesStrSize", str_size)
         data.set("Prefix", xmlio.asc(prefix))
         data.set("Number", num)
         return item
     item = ET.Element("CIRToInfoMapItem", {"CIRKey": xmlio.asc(refdes)})
     info = ET.SubElement(item, "RefDesInfo", {"Class": "CIITHierRefDesInfo", "IRPrefix": xmlio.asc(prefix),
-                                              "IRNumber": num, "Locked": "0", "IRSection": "", "IRSectionID": "-1",
+                                              "IRNumber": num, "Locked": "0", "IRSection": "", "IRSectionID": "0",
                                               "SpiceTemplate": ""})
     data = ET.SubElement(info, "RefDesInfoData", {
-        "Class": "CIITHierRefDes", "RefDesBufSize": "260", "RefDesStrSize": str(len(text)), "RefDesCount": "2",
+        "Class": "CIITHierRefDes", "RefDesBufSize": "260", "RefDesStrSize": str_size, "RefDesCount": "2",
         "RefDes": text, "SectionBufSize": "0", "SectionStrSize": "0", "Section": "&ASC(null)",
         "Prefix": xmlio.asc(prefix), "Number": num})
     ET.SubElement(data, "RefDesData")
     for tag in ("PinOrderCIR", "PinOrderIR", "PinNumbersCIR", "PinNumbersIR", "SharedPins"):
         ET.SubElement(info, tag)
     return item
+
+
+def _populate_prefix_usage(usage_map: ET.Element, refdes_items: list[ET.Element]) -> None:
+    """Populate RefDesPrefixUsageMap from CIRToInfoMapItem records.
+
+    Multisim expects every active refdes prefix and placed slot number
+    (NumberUsed = int(IRNumber), NextNumber = max(used) + 1) to be registered in
+    RefDesPrefixUsageMap; an empty map or missing active slot triggers
+    0xC0000374 heap corruption inside COM ReplaceComponent.
+    """
+    groups = {}
+    for item in refdes_items:
+        info = item.find("RefDesInfo")
+        if info is None:
+            continue
+        ir_prefix = xmlio.unasc(info.get("IRPrefix") or "")
+        if not ir_prefix:
+            continue
+        key = ir_prefix.upper()
+        entry = groups.setdefault(key, {"prefix": ir_prefix, "numbers": [], "multi": {}})
+        try:
+            slot = max(0, int(info.get("IRNumber") or 0))
+        except ValueError:
+            slot = 0
+        if slot not in entry["numbers"]:
+            entry["numbers"].append(slot)
+        if xmlio.unasc(info.get("IRSection") or ""):
+            try:
+                sec_id = max(0, int(info.get("IRSectionID") or 0))
+            except ValueError:
+                sec_id = 0
+            entry["multi"].setdefault(slot, set()).add(sec_id)
+    for key, entry in groups.items():
+        next_num = max((n for n in entry["numbers"] if n >= 1), default=0) + 1
+        usage = ET.SubElement(usage_map, "RefDesPrefixUsage", {
+            "RefDes": xmlio.asc(key),
+            "Class": "CIITRefDesPrefixUsage",
+            "Prefix": xmlio.asc(entry["prefix"]),
+            "NextNumber": str(next_num),
+        })
+        inner = ET.SubElement(usage, "RefDesPrefixUsage")
+        for num in entry["numbers"]:
+            ET.SubElement(inner, "NumbersUsedVTwo", {"NumberUsed": str(num)})
+        multi = ET.SubElement(usage, "MultisectionUsage")
+        for num, sec_ids in entry["multi"].items():
+            ms_item = ET.SubElement(multi, "MultisectionItem", {"NumberOfMultisection": str(num)})
+            sec_usage = ET.SubElement(ms_item, "SectionUsage")
+            for idx in range(max(sec_ids) + 1):
+                ET.SubElement(sec_usage, "SectionUsageItem", {"SectionUsed": "1" if idx in sec_ids else "0"})
 
 
 def _set_key(node, key, value):
@@ -414,7 +473,7 @@ class Builder:
         """nets: {port name: net}; center: target pin centre coordinate."""
         part = self.lib.load(part_name)
         pin_order = self.lib.index[self.lib.resolve(part_name)]["pins"]
-        items = [xmlio.deepcopy(i) for i in part.find("Items")]
+        items = list(part.find("Items"))
         xmlio.remap(items, self.ids)
         comp_item = next(i for i in items if i.get("Class") == "CiComponent")
         ports = [i for i in items if i.get("Class") == "CiPort"]
@@ -436,7 +495,7 @@ class Builder:
                 m.set("LocalName", xmlio.asc(new))
                 card = m.find("Attributes/Item/CiaCString")
                 if card is not None:
-                    card.set("String", re.sub(r"(?i)^(&ASC\s*\.(?:SUBCKT|MODEL)\s+)\S+", lambda mm: mm.group(1) + new,
+                    card.set("String", re.sub(r"(?i)^(&ASC\s*\.(?:SUBCKT|MODEL)\s+)\S+", lambda mm, n=new: mm.group(1) + n,
                                               card.get("String", ""), count=1))
 
         kind = refdes[0].upper()
@@ -470,7 +529,7 @@ class Builder:
         sym.set("Transformer-M21", f"{ty:g}")
 
         name_of = {p.get("CiID"): xmlio.unasc(p[0].get("LocalName")) for p in ports}
-        hidden = {h.get("Name"): h.get("Net") for h in part.findall("HiddenPin")}
+        hidden = {h.get("Name"): h.get("Net").lower() for h in part.findall("HiddenPin") if h.get("Net")}
         pts = []
         for port in ports:
             pname = name_of[port.get("CiID")]
@@ -805,6 +864,10 @@ class Builder:
         if mapping is not None:
             for item in self.refdes_items:
                 mapping.append(item)
+        usage_map = xmlio.find_tag(self.root, "RefDesPrefixUsageMap")
+        if usage_map is not None:
+            xmlio.clear(usage_map)
+            _populate_prefix_usage(usage_map, self.refdes_items)
         data = xmlio.find_tag(self.root, "InstrumentsData")
         for ref, state in self.instrument_states:
             apply_instrument(state, ref, instruments.get(ref, {}), params_of.get(ref, {}))
@@ -853,14 +916,27 @@ class Builder:
 
 SPEC_FIELDS = {"netlist", "output", "layout", "instruments", "sim_time", "net_names", "colors",
                "wires", "wire_width", "sheet"}
-REPAIR_BUDGET_PER_CANDIDATE = 0.5      # seconds; a routed candidate takes about 0.2 s
+REPAIR_BUDGET_PER_CANDIDATE = 0.5      # seconds; generous ceiling even on slow hosts
+_INSTRUMENT_REF = re.compile(r"^(?:XSC|XFG|XBP|XMM)\d*$", re.I)
 
 
 def _layout_key(layout: dict, refdes: str):
-    for key in (refdes, refdes.upper(), "X" + refdes, refdes.lstrip("Xx")):
+    stripped = refdes[1:] if len(refdes) > 1 and refdes[0] in "Xx" else refdes
+    for key in (refdes, refdes.upper(), "X" + refdes, stripped):
         if key in layout:
             return layout[key]
     return None
+
+
+def _write_atomic(root: ET.Element, out: Path, run_id: str) -> None:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f".{out.name}.tmp-{run_id}")
+    try:
+        xmlio.save(root, tmp, compress=out.suffix.lower() == ".ms14")
+        os.replace(tmp, out)          # atomic: a failed build never leaves a half-written .ms14
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
 
 
 def build(spec: dict, lib: Library | None = None, allow_fallback: bool = False,
@@ -879,48 +955,34 @@ def build(spec: dict, lib: Library | None = None, allow_fallback: bool = False,
     except RouteError:
         if allow_fallback or not auto_repair:
             raise
-        out = Path(spec["output"]).resolve()       # only the repair loop needs a staging location
-        best = None                                # (score, result, staged_file)
-        staged = []                                # one file per candidate, committed only at the end
-        # A budget of "3 seconds" is arbitrary when one candidate costs a fraction of a
-        # second: it cuts the search off before the blocker that actually matters comes
-        # up. The default is a per-candidate allowance, so the search always covers the
-        # candidate list it was given.
+        out = Path(spec["output"]).resolve()
+        best = None                                # (score, root, result)
         if repair_budget_s is None:
             repair_budget_s = REPAIR_BUDGET_PER_CANDIDATE * max_repairs
         deadline = time.monotonic() + repair_budget_s
-        try:
-            for index, (candidate, moves) in enumerate(_repair_variants(spec, max_repairs)):
-                if time.monotonic() > deadline:
-                    break                          # keep a failing build fast; report the best attempt so far
-                attempt = out.with_name(f".{out.stem}.repair-{index}{out.suffix}")
-                try:
-                    result = _build_once(candidate, lib, allow_fallback, out=attempt)
-                except RouteError:
-                    continue
-                staged.append(attempt)
-                result["moved_parts"] = moves
-                moved = ", ".join(f"{name} by ({dx:+g},{dy:+g})" for name, (dx, dy) in moves.items())
-                result["warnings"] = list(result["warnings"]) + [f"layout auto-repaired: moved {moved} so the router could pass"]
-                score = _repair_score(result)
-                if score == 0:
-                    if best is not None:
-                        best[2].unlink(missing_ok=True)
-                    _commit(attempt, out, result)
-                    return result                  # routed cleanly with nothing left to report
-                if best is None or score < best[0]:
-                    if best is not None:
-                        best[2].unlink(missing_ok=True)
-                    best = (score, result, attempt)
-                else:
-                    attempt.unlink(missing_ok=True)
-            if best is not None:
-                _commit(best[2], out, result=best[1])
-                return best[1]
-            raise
-        finally:
-            for path in staged:
-                path.unlink(missing_ok=True)
+        for candidate, moves in _repair_variants(spec, max_repairs):
+            if time.monotonic() > deadline:
+                break                              # keep a failing build fast; report the best attempt so far
+            try:
+                root, result = _assemble(candidate, lib, allow_fallback, out=out)
+            except RouteError:
+                continue
+            result["moved_parts"] = moves
+            moved = ", ".join(f"{name} by ({dx:+g},{dy:+g})" for name, (dx, dy) in moves.items())
+            result["warnings"] = list(result["warnings"]) + [f"layout auto-repaired: moved {moved} so the router could pass"]
+            score = _repair_score(result, root=root)
+            if score == 0:
+                best = (0, root, result)
+                break
+            if best is None or score < best[0]:
+                best = (score, root, result)
+        if best is not None:
+            _, win_root, win_result = best
+            _write_atomic(win_root, out, win_result["run_id"])
+            win_result["ms14"] = str(out)
+            win_result["sha256"] = hashlib.sha256(out.read_bytes()).hexdigest()
+            return win_result
+        raise
 
 
 def _commit(source: Path, target: Path, result: dict) -> None:
@@ -931,60 +993,87 @@ def _commit(source: Path, target: Path, result: dict) -> None:
     result["sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
 
 
-def _repair_score(result: dict) -> int:
+def _repair_score(result: dict, root=None) -> int:
     """How much is still wrong with a repaired build: problems first, then crossings, then warnings."""
     from . import check
-    report = check.check_file(result["ms14"], result.get("expected"))
+    report = (
+        check.check_root(root, result.get("expected"), source=result.get("ms14", "<memory>"))
+        if root is not None
+        else check.check_file(result["ms14"], result.get("expected"))
+    )
     return len(report["problems"]) * 1000 + len(report["warnings"]) * 10 + len(result["warnings"]) - 1
 
 
 def _repair_variants(spec: dict, limit: int):
-    """Yield (spec_with_moved_parts, {label: (dx, dy)}) for small layout nudges.
+    """Yield (spec_with_moved_parts, {label: (dx, dy)}) for small grid-aligned layout nudges.
 
     Ground symbols come first (small, and the usual blocker when a part is placed
-    over one), then the parts; instruments never move. Offsets escalate from half
-    a grid step to four, in both axes.
+    over one), then the parts; instruments never move. Offsets escalate from one
+    grid step (9 units) to four (36 units), in both axes.
     """
     layout = spec.get("layout") or {}
     targets = [("GND", index) for index in range(len(layout.get("GND") or []))]
     targets += [("part", name) for name, pos in layout.items()
                 if isinstance(pos, list) and len(pos) >= 2 and isinstance(pos[0], (int, float))
-                and str(name).upper() != "GND" and not str(name).upper().startswith("X")]
-    offsets = [(0, 12), (0, -12), (12, 0), (-12, 0), (0, 24), (0, -24), (24, 0), (-24, 0),
-               (0, 36), (0, -36), (36, 0), (-36, 0)]
+                and str(name).upper() != "GND" and _INSTRUMENT_REF.match(str(name)) is None]
+    offsets = [
+        (0, 9), (0, -9), (9, 0), (-9, 0),
+        (0, 27), (0, -27), (27, 0), (-27, 0),
+        (0, 36), (0, -36), (36, 0), (-36, 0),
+        (0, 18), (0, -18), (18, 0), (-18, 0),
+    ]
     boxes = []
     for name, pos in layout.items():
         if isinstance(pos, list) and len(pos) >= 2 and isinstance(pos[0], (int, float)) and str(name).upper() != "GND":
-            boxes.append((float(pos[0]), float(pos[1]), 126.0, 108.0))
+            # Layout coordinates are component centres; bound box around centre.
+            boxes.append((float(pos[0]) - 63.0, float(pos[1]) - 54.0, 126.0, 108.0))
     made = 0
     # Breadth first: give every movable object its smallest nudge before deepening any
-    # single one. Trying one object's twelve offsets in a row exhausts the budget on a
+    # single one. Trying one object's offsets in a row exhausts the budget on a
     # blocker that is not the cause, and the object that is the cause never gets a turn.
     for dx, dy in offsets:
         for kind, key in targets:
             if made >= limit:
                 return
-            candidate = json.loads(json.dumps(spec))
             if kind == "GND":
-                point = list(candidate["layout"]["GND"][key])
-                point[0] = float(point[0]) + dx
-                point[1] = float(point[1]) + dy
-                candidate["layout"]["GND"][key] = point
+                orig = layout["GND"][key]
+                nx, ny = float(orig[0]) + dx, float(orig[1]) + dy
+                if any(x < nx < x + w and y < ny < y + h for x, y, w, h in boxes):
+                    continue                   # a symbol dropped inside a part cannot help; skip without building
+                new_layout = dict(layout)
+                gnds = [list(p) for p in layout["GND"]]
+                gnds[key][0] = nx
+                gnds[key][1] = ny
+                new_layout["GND"] = gnds
                 label = f"GND[{key}]"
             else:
-                pos = list(candidate["layout"][key])
+                orig = layout[key]
+                new_layout = dict(layout)
+                pos = list(orig)
                 pos[0] = float(pos[0]) + dx
                 pos[1] = float(pos[1]) + dy
-                candidate["layout"][key] = pos
+                new_layout[key] = pos
                 label = key
-            point = candidate["layout"]["GND"][key] if kind == "GND" else candidate["layout"][key]
-            if kind == "GND" and any(x < point[0] < x + w and y < point[1] < y + h for x, y, w, h in boxes):
-                continue                       # a symbol dropped inside a part cannot help; skip without building
+            candidate = dict(spec)
+            candidate["layout"] = new_layout
             made += 1
             yield candidate, {label: (dx, dy)}
 
 
-def _build_once(spec: dict, lib: Library, allow_fallback: bool, out=None) -> dict:
+def _parse_color(net: str, color) -> int:
+    if isinstance(color, str):
+        val = COLORS.get(color.lower())
+        if val is not None:
+            return val
+        if color.isdigit():
+            return int(color)
+        raise ValueError(f"colors.{net}: unknown colour {color!r}; valid names are {sorted(COLORS)}")
+    if isinstance(color, int) and not isinstance(color, bool) and color >= 0:
+        return color
+    raise ValueError(f"colors.{net}: invalid colour {color!r}")
+
+
+def _assemble(spec: dict, lib: Library, allow_fallback: bool, out=None) -> tuple[ET.Element, dict]:
     run_id = new_run_id()
     missing = [k for k in ("netlist", "output") if not spec.get(k)]
     if missing:
@@ -1000,6 +1089,7 @@ def _build_once(spec: dict, lib: Library, allow_fallback: bool, out=None) -> dic
     layout = spec.get("layout") or {}
     b = Builder(lib, out)
     params_of = {}
+    placed_refs = set()
     auto = 0
     for inst in instances:
         key = lib.resolve(inst.part)
@@ -1007,9 +1097,18 @@ def _build_once(spec: dict, lib: Library, allow_fallback: bool, out=None) -> dic
             raise KeyError(f"{inst.refdes}: part {inst.part!r} is not in the part library (search with 'multisimforge parts list', "
                            f"fetch it from the Multisim database with 'multisimforge parts fetch {inst.part}')")
         info = lib.index[key]
+        if int(info.get("sections") or 1) > 1:
+            b.warnings.append(
+                f"{inst.refdes} ({key}) has {info['sections']} physical sections; "
+                "this template places section A only. Separate instances are NOT "
+                "automatically linked to the same IC package."
+            )
         refdes = inst.refdes
         if refdes[0] in "Xx" and info["kind"] != "instrument" and len(refdes) > 1 and refdes[1].isalpha():
             refdes = refdes[1:]                      # XU1 -> U1 (Multisim naming convention)
+        if refdes.upper() in placed_refs:
+            raise ValueError(f"duplicate refdes after naming normalization: {refdes} (from {inst.refdes})")
+        placed_refs.add(refdes.upper())
         pins = info["pins"]
         if inst.named:
             bad = [p for p in inst.named if p not in pins and p not in info["hidden_pins"]]
@@ -1048,39 +1147,56 @@ def _build_once(spec: dict, lib: Library, allow_fallback: bool, out=None) -> dic
         if inst.part == "SCOPE" and len(inst.nets) > 1 and inst.nets[1] != "0":
             colors[inst.nets[1]] = COLORS["blue"]
     for net, color in (spec.get("colors") or {}).items():
-        colors[nl.net_name(net)] = COLORS.get(str(color).lower(), color)
-    b.wire_all(colors, bool(spec.get("net_names")), spec.get("wires") or {}, int(spec.get("wire_width", 1)),
+        colors[nl.net_name(net)] = _parse_color(net, color)
+    wire_width = int(spec.get("wire_width", 1))
+    if wire_width < 1:
+        raise ValueError("wire_width must be at least 1")
+    b.wire_all(colors, bool(spec.get("net_names")), spec.get("wires") or {}, wire_width,
                allow_fallback=allow_fallback)
 
     instruments = spec.get("instruments") or {}
-    sim_time = number(spec["sim_time"]) if spec.get("sim_time") else None
+    sim_time = None
+    if spec.get("sim_time") is not None:
+        sim_time = number(spec["sim_time"])
+        if not math.isfinite(sim_time) or sim_time <= 0:
+            raise ValueError(f"sim_time must be finite and positive, got {spec['sim_time']!r}")
     sweep = None
     scopes = [i for i in instances if i.part == "SCOPE"]
     if scopes:
-        sweep = 10 * number((instruments.get(scopes[0].refdes) or {}).get("timebase", 1e-3))
+        tb = number((instruments.get(scopes[0].refdes) or {}).get("timebase", 1e-3))
+        if not math.isfinite(tb) or tb <= 0:
+            raise ValueError(f"{scopes[0].refdes}: timebase must be finite and positive")
+        sweep = 10 * tb
         sim_time = sim_time or 20 * sweep
     b.finish(instruments, params_of, sim_time, spec.get("sheet"))
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(f".{out.name}.tmp-{run_id}")
-    try:
-        xmlio.save(b.root, tmp, compress=out.suffix.lower() == ".ms14")
-        os.replace(tmp, out)          # atomic: a failed build never leaves a half-written .ms14
-    finally:
-        if tmp.exists():
-            tmp.unlink(missing_ok=True)
-    return {"ms14": str(out), "run_id": run_id, "sim_time": sim_time, "sweep": sweep,
-            "placements": b.placements, "wires": b.wires, "boxes": b.boxes,
-            "warnings": b.warnings, "expected": b.expected,
-            "degraded": b.degraded, "route_failures": b.route_failures}
+    return b.root, {
+        "ms14": str(out), "run_id": run_id, "sim_time": sim_time, "sweep": sweep,
+        "placements": b.placements, "wires": b.wires, "boxes": b.boxes,
+        "warnings": b.warnings, "expected": b.expected,
+        "degraded": b.degraded, "route_failures": b.route_failures,
+    }
+
+
+def _build_once(spec: dict, lib: Library, allow_fallback: bool, out=None) -> dict:
+    root, result = _assemble(spec, lib, allow_fallback, out=out)
+    _write_atomic(root, Path(result["ms14"]), result["run_id"])
+    return result
 
 
 def set_sim_time(ms14, sim_time: float):
     """Change only the interactive simulation stop time (used by capture when aligning the scope sweep)."""
+    val = float(sim_time)
+    if not math.isfinite(val) or val <= 0:
+        raise ValueError(f"sim_time must be finite and positive, got {sim_time!r}")
     root = xmlio.load(ms14)
-    diagram = next(root.iter("CIITDiagram"))
+    diagram = next(root.iter("CIITDiagram"), None)
+    if diagram is None:
+        raise ValueError(f"{ms14} has no CIITDiagram")
     head, sep, tail = (diagram.get("SimState") or "").partition("DEFAULT_INST_SETTINGS")
     if not sep:
         raise ValueError("the file has no interactive simulation settings (sim_time was not written when it was generated)")
-    tail = re.sub(r"TSTOP:double\{[^}]*\}", f"TSTOP:double{{{sim_time:g}}}", tail, count=1)
+    tail, count = re.subn(r"TSTOP:double\{[^}]*\}", f"TSTOP:double{{{val:g}}}", tail, count=1)
+    if count != 1:
+        raise ValueError("the file has no TSTOP interactive simulation parameter")
     diagram.set("SimState", head + sep + tail)
-    xmlio.save(root, ms14)
+    _write_atomic(root, Path(ms14), new_run_id())

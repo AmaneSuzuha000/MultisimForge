@@ -7,6 +7,7 @@ Probe insertion: place a voltage probe on a wire endpoint of the target net, sav
 import cmath
 import csv
 import math
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -80,34 +81,49 @@ def net_wires(root):
 def add_probes(root, nets, lib: Library, ms14_path: str) -> dict:
     """Place voltage probes on the specified nets and return {net: output variable name}."""
     wires, pins = net_wires(root)
-    diagram = next(d for d in root.iter("CIITDiagram") if d.find("./Elements") is not None
-                   and any(c.get("Class") == "CiCircuit" for c in d.find("./Elements")))
+    diagram = next((d for d in root.iter("CIITDiagram") if d.find("./Elements") is not None
+                    and any(c.get("Class") == "CiCircuit" for c in d.find("./Elements"))), None)
+    if diagram is None:
+        raise ValueError("Design has no primary CIITDiagram with a CiCircuit")
     composite = diagram.find("./Components/CODComposite")
     elements = diagram.find("./Elements")
     circuit_item = next(c for c in elements if c.get("Class") == "CiCircuit")
-    objects = composite.find("Objects")
+    objects = composite.find("Objects") if composite is not None else None
     probe_exts = circuit_item[0].find("ProbeExts")
+    if probe_exts is None:
+        probe_exts = ET.SubElement(circuit_item[0], "ProbeExts")
     data = xmlio.find_tag(root, "InstrumentsData")
     container = xmlio.find_tag(root, "RefDesInfoContainer")
-    cir_map = container.find("CIRToInfoMap")
+    cir_map = container.find("CIRToInfoMap") if container is not None else None
     prefix_map = xmlio.find_tag(root, "RefDesPrefixUsageMap")
     triggers = xmlio.find_tag(root, "TotalProbeTriggers")
+    if any(x is None for x in (composite, elements, objects, data, container, cir_map, prefix_map, triggers)):
+        raise ValueError("Design is missing required structural sections for probe injection")
     trigger_set = triggers.find("TriggerSet")
     if trigger_set is None:
         trigger_set = ET.SubElement(triggers, "TriggerSet")
     circuit_name = Path(ms14_path).stem
     tree_instance = container.get("CIR") or f"&ASC#1/{circuit_name}:"
-    ids = xmlio.IdAllocator(950_000_000)
+    ids = xmlio.IdAllocator(max(950_000_000, xmlio.max_id(root) + 1))
     next_id = int(triggers.get("NextProbeID") or 1)
+    existing_pr = {int(m.group(1)) for it in elements if it.get("Class") == "CiProbeExtComp" and len(it)
+                   for m in [re.match(r"^PR(\d+)$", xmlio.unasc(it[0].get("LocalName") or ""))] if m}
+    pr_num = max(existing_pr, default=0) + 1
+    usage = next((u for u in prefix_map.findall("RefDesPrefixUsage") if u.get("RefDes") == "&ASCOUTPROBE"), None)
+    inner_usage = usage.find("RefDesPrefixUsage") if usage is not None else None
+    used_slots = {int(nu.get("NumberUsed")) for nu in inner_usage.findall("NumbersUsedVTwo")
+                  if nu.get("NumberUsed") is not None} if inner_usage is not None else set()
+    slot = max(used_slots, default=-1) + 1
     outputs = {}
-    for index, net in enumerate(nets, start=1):
+    added_slots = []
+    for net in nets:
         net = net.lower()
         if net not in wires:
             raise ValueError(f"No wire on net {net!r}; cannot place a probe. Existing nets: {sorted(wires)}")
         point = _probe_point(wires[net], [p for n, ps in wires.items() if n != net for p in ps], pins)
         if point is None:
             raise ValueError(f"Could not find a location on net {net!r} to place a probe")
-        refdes = f"PR{index}"
+        refdes = f"PR{pr_num}"
         element = lib.struct("probe_element.xml")
         symbol = lib.struct("probe_symbol.xml")
         state = lib.struct("probe_instrument.xml")
@@ -133,14 +149,15 @@ def add_probes(root, nets, lib: Library, ms14_path: str) -> dict:
         probe_exts.append(ET.Element("Item", {"CiID": element.get("CiID")}))
         data.append(state)
         text = f"&ASC!0!0!0{refdes}!0{ms14_path}!01!0{circuit_name}!0"
+        ir_num = -1 if slot == 0 else slot
         item = ET.SubElement(cir_map, "CIRToInfoMapItem", {"CIRKey": xmlio.asc(refdes)})
         info = ET.SubElement(item, "RefDesInfo", {"Class": "CIITHierRefDesInfo", "IRPrefix": "&ASCOutProbe",
-                                                  "IRNumber": str(-1 if index == 1 else index - 1), "Locked": "0",
+                                                  "IRNumber": str(ir_num), "Locked": "0",
                                                   "IRSection": "", "IRSectionID": "0", "SpiceTemplate": ""})
         rd = ET.SubElement(info, "RefDesInfoData", {
             "Class": "CIITHierRefDes", "RefDesBufSize": "260", "RefDesStrSize": str(len(text)), "RefDesCount": "2",
             "RefDes": text, "SectionBufSize": "0", "SectionStrSize": "0", "Section": "&ASC(null)",
-            "Prefix": "&ASCPR", "Number": str(index)})
+            "Prefix": "&ASCPR", "Number": str(pr_num)})
         ET.SubElement(rd, "RefDesData")
         for tag in ("PinOrderCIR", "PinOrderIR", "PinNumbersCIR", "PinNumbersIR", "SharedPins"):
             ET.SubElement(info, tag)
@@ -148,14 +165,26 @@ def add_probes(root, nets, lib: Library, ms14_path: str) -> dict:
         pt = ET.SubElement(ET.SubElement(trig, "Triggers"), "ProbeTriggers", {"Class": "&ASCCProbeTriggers", "NumTriggers": "0"})
         ET.SubElement(pt, "Triggers")
         next_id += 1
-        outputs[net] = f"V(OutProbe{'' if index == 1 else index - 1})"
+        outputs[net] = f"V(OutProbe{'' if slot == 0 else slot})"
+        added_slots.append(slot)
+        pr_num += 1
+        slot += 1
     triggers.set("NextProbeID", str(next_id))
-    usage = ET.SubElement(prefix_map, "RefDesPrefixUsage", {"RefDes": "&ASCOUTPROBE", "Class": "CIITRefDesPrefixUsage",
-                                                            "Prefix": "&ASCOutProbe", "NextNumber": str(len(nets))})
-    inner = ET.SubElement(usage, "RefDesPrefixUsage")
-    for k in range(len(nets)):
-        ET.SubElement(inner, "NumbersUsedVTwo", {"NumberUsed": str(k)})
-    ET.SubElement(usage, "MultisectionUsage")
+    if added_slots:
+        if usage is None:
+            usage = ET.SubElement(prefix_map, "RefDesPrefixUsage", {"RefDes": "&ASCOUTPROBE", "Class": "CIITRefDesPrefixUsage",
+                                                                    "Prefix": "&ASCOutProbe", "NextNumber": str(slot)})
+            inner_usage = ET.SubElement(usage, "RefDesPrefixUsage")
+            for k in added_slots:
+                ET.SubElement(inner_usage, "NumbersUsedVTwo", {"NumberUsed": str(k)})
+            ET.SubElement(usage, "MultisectionUsage")
+        else:
+            prev_next = int(usage.get("NextNumber") or 0)
+            usage.set("NextNumber", str(max(prev_next, slot)))
+            if inner_usage is None:
+                inner_usage = ET.SubElement(usage, "RefDesPrefixUsage")
+            for k in added_slots:
+                ET.SubElement(inner_usage, "NumbersUsedVTwo", {"NumberUsed": str(k)})
     return outputs
 
 
@@ -189,7 +218,11 @@ def ac_summary(freq, h, at=()):
         raise ValueError("the AC sweep produced no points; check the sweep range and that the simulation ran")
     if len(freq) != len(h):
         raise ValueError(f"the AC sweep returned {len(freq)} frequencies but {len(h)} values")
+    if any(not math.isfinite(f) or f <= 0 for f in freq) or any(b <= a for a, b in zip(freq, freq[1:])):
+        raise ValueError("AC frequencies must be finite, positive and strictly increasing")
     mag = [abs(v) for v in h]
+    if any(not math.isfinite(v) for v in mag):
+        raise ValueError("AC values contain non-finite magnitudes")
     phase = _unwrap([math.degrees(cmath.phase(v)) for v in h])
     k = max(range(len(mag)), key=mag.__getitem__)
     level = mag[k] / math.sqrt(2)
@@ -201,6 +234,8 @@ def ac_summary(freq, h, at=()):
             cutoffs.append(fc)
 
     def point(x):
+        if not math.isfinite(x) or x < freq[0] or x > freq[-1]:
+            raise ValueError(f"AC requested frequency {x:g} is outside measured sweep [{freq[0]:g}, {freq[-1]:g}]")
         g = _interp_log(freq, mag, x)
         return {"f": x, "gain": g, "dB": 20 * math.log10(g) if g > 0 else None, "phase_deg": _interp_log(freq, phase, x)}
 
@@ -213,10 +248,14 @@ def tran_summary(t, v):
         raise ValueError("the transient analysis produced no samples; check the duration and that the simulation ran")
     if len(t) != len(v):
         raise ValueError(f"the transient analysis returned {len(t)} timestamps but {len(v)} values")
+    if any(not math.isfinite(x) for x in t) or any(not math.isfinite(x) for x in v):
+        raise ValueError("transient samples contain non-finite values")
     n = len(v)
     mean = sum(v) / n
     rms = math.sqrt(sum(x * x for x in v) / n)
-    crossings = [t[i] for i in range(n - 1) if (v[i] - mean) < 0 <= (v[i + 1] - mean)]
+    # Interpolate each rising crossing to remove sampling-grid bias.
+    crossings = [t[i] + ((mean - v[i]) / (v[i + 1] - v[i])) * (t[i + 1] - t[i])
+                 for i in range(n - 1) if (v[i] - mean) < 0 <= (v[i + 1] - mean)]
     period = (crossings[-1] - crossings[0]) / (len(crossings) - 1) if len(crossings) > 2 else None
     return {"max": max(v), "min": min(v), "pp": max(v) - min(v), "mean": mean, "rms": rms,
             "period": period, "freq": 1 / period if period else None}
@@ -230,15 +269,16 @@ def run(ms14: str, nets: list, op=False, ac=None, tran=None, ac_out=None, ac_in=
     """ac = (start frequency, stop frequency, points per decade); tran = (duration, sample rate or None)."""
     lib = lib or Library()
     nets = [n.lower() for n in dict.fromkeys(list(nets) + [n for n in (ac_out, ac_in) if n])]
-    if not nets:
-        raise ValueError("Specify at least one net to measure")
+    probe_nets = [n for n in nets if n != "0"]
+    if not probe_nets:
+        raise ValueError("Specify at least one non-ground net to measure")
     root = xmlio.load(ms14)
     from .result import new_run_id
     run_id = new_run_id()
     work = Path(CONFIG["work_dir"]) / "probe" / run_id
     work.mkdir(parents=True, exist_ok=True)
     probe_file = work / Path(ms14).name          # The file name (circuit name) must stay unchanged; probe and instrument records are matched by it
-    outputs = add_probes(root, [n for n in nets if n != "0"], lib, str(probe_file))
+    outputs = add_probes(root, probe_nets, lib, str(probe_file))
     xmlio.save(root, probe_file)
     analyses = []
     if op:
@@ -250,13 +290,24 @@ def run(ms14: str, nets: list, op=False, ac=None, tran=None, ac_out=None, ac_in=
     raw = com.call({"op": "analyze", "ms14": str(probe_file), "analyses": analyses})
     by_output = {v: k for k, v in outputs.items()}
     result = {"outputs": outputs}
-    for a in raw["results"]:
+    if not raw.get("results"):
+        result.setdefault("failures", []).append("simulator returned no analysis results")
+    for a in raw.get("results", []):
         if a["missing"]:
             result.setdefault("missing", []).extend(a["missing"])
             result.setdefault("failures", []).append(
                 f"{a['type']} analysis did not return {', '.join(a['missing'])}: {a['last_error']}")
             result.setdefault("warnings", []).append(f"{a['type']} analysis did not return {a['missing']}: {a['last_error']}")
         data = {by_output[k]: rows for k, rows in a["data"].items()}
+        if not data:
+            result.setdefault("failures", []).append(f"{a['type']} analysis returned no measured vectors")
+            continue
+        if a["type"] == "ac" and not data[next(iter(data))][0]:
+            result.setdefault("failures", []).append("AC analysis returned zero frequency points")
+            continue
+        if a["type"] == "tran" and not data[next(iter(data))][0]:
+            result.setdefault("failures", []).append("transient analysis returned zero time samples")
+            continue
         if a["type"] == "op":
             result["op"] = {net: rows[1][0] if len(rows) > 1 else rows[0][0] for net, rows in data.items()}
         elif a["type"] == "ac" and data:
@@ -316,11 +367,19 @@ def spice(netlist_text: str, commands: list) -> dict:
 def read_raw(path) -> dict:
     """Read an ASCII SPICE raw file: {variable name: [values...]}; complex values are returned as complex."""
     lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
-    i = next(k for k, line in enumerate(lines) if line.startswith("Variables:")) + 1
+    try:
+        i = next(k for k, line in enumerate(lines) if line.startswith("Variables:")) + 1
+    except StopIteration as exc:
+        raise ValueError("SPICE raw file has no Variables section") from exc
     names = []
-    while not lines[i].startswith("Values:"):
-        names.append(lines[i].split("\t")[-1].split()[0] if "\t" in lines[i] else lines[i].split()[1])
+    while i < len(lines) and not lines[i].startswith("Values:"):
+        fields = lines[i].split()
+        if len(fields) < 2:
+            raise ValueError(f"invalid SPICE variable line: {lines[i]!r}")
+        names.append(fields[1])
         i += 1
+    if i >= len(lines) or not names:
+        raise ValueError("SPICE raw file lacks a complete Variables/Values section")
     values = []
     for line in lines[i + 1:]:
         tok = line.split()

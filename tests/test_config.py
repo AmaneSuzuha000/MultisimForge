@@ -35,7 +35,12 @@ def test_python32_argv_splits_a_launcher_command(monkeypatch):
 
 def test_python32_honours_the_environment_override(monkeypatch, tmp_path):
     monkeypatch.setenv("MULTISIMFORGE_PYTHON32", r"D:\custom\python.exe")
-    assert config._detect_python32() == r"D:\custom\python.exe"
+    # Detection is Windows-specific, but the resolved CONFIG honours overrides on all platforms.
+    if sys.platform == "win32":
+        assert config._detect_python32() == r"D:\custom\python.exe"
+    else:
+        assert config._detect_python32() == sys.executable
+    assert config._load()["python32"] == r"D:\custom\python.exe"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the 32-bit rule is Windows-only")
@@ -56,7 +61,13 @@ def test_the_configured_python32_runs(monkeypatch):
     if not Path(argv[0]).exists():
         pytest.skip(f"{argv[0]} is not installed on this machine")
     import subprocess
-    out = subprocess.run([*argv, "-c", "import win32com"], capture_output=True, text=True, timeout=60)
+    try:
+        # stdin=DEVNULL: CPython 3.14's fd capture fails with WinError 6 when the
+        # parent's handles are redirected (the same reason run_cli passes it)
+        out = subprocess.run([*argv, "-c", "import win32com"], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=60)
+    except OSError as exc:
+        pytest.skip(f"cannot spawn the 32-bit interpreter from this test process: {exc}")
     if out.returncode != 0:
         pytest.skip("pywin32 is not installed for the 32-bit interpreter yet")
 

@@ -6,7 +6,6 @@ Coordinates are in Multisim schematic units (about 1/96 inch), y axis pointing d
 """
 import heapq
 from bisect import bisect_left, bisect_right
-from functools import lru_cache
 
 
 class RouteError(ValueError):
@@ -97,6 +96,8 @@ def route(start, end, obstacles, *, occupied=None, dense=0):
     for p in (start, end):
         if any(x0 < p[0] < x1 and y0 < p[1] < y1 for x0, y0, x1, y1 in boxes):
             raise ValueError(f"routing endpoint is inside a part: {p}")
+    if start == end:
+        return [start]
     xs, ys = {start[0], end[0]}, {start[1], end[1]}
     for x0, y0, x1, y1 in boxes:
         xs.update((x0 - 9, x1 + 9))
@@ -110,16 +111,7 @@ def route(start, end, obstacles, *, occupied=None, dense=0):
     for a, b in occupied:
         (v_by_col.setdefault(a[0], []) if a[0] == b[0] else h_by_row.setdefault(a[1], [])).append((a, b))
     h_rows = sorted(h_by_row.items())
-    h_ys = [y for y, _ in h_rows]
     v_cols = sorted(v_by_col.items())
-    v_xs = [x for x, _ in v_cols]
-
-    def in_range(indexed, coords, lo, hi):
-        lo, hi = min(lo, hi), max(lo, hi)
-        out = []
-        for _, segs in indexed[bisect_left(coords, lo):bisect_right(coords, hi)]:
-            out.extend(segs)
-        return out
 
     xs.update((min(xs) - 18, max(xs) + 18))
     ys.update((min(ys) - 18, max(ys) + 18))
@@ -127,39 +119,101 @@ def route(start, end, obstacles, *, occupied=None, dense=0):
     if dense:
         xx = sorted(set(xx) | {(a + b) / 2 for a, b in zip(xx, xx[1:])})
         yy = sorted(set(yy) | {(a + b) / 2 for a, b in zip(yy, yy[1:])})
+    nx_len, ny_len = len(xx), len(yy)
+    # Precompute bitmasks of edges blocked by boxes, collinear occupied wires, and occupied segment endpoints.
+    h_block = [0] * ny_len
+    v_block = [0] * nx_len
+    for x0, y0, x1, y1 in boxes:
+        if x1 <= x0 or y1 <= y0:
+            continue
+        iy_lo = bisect_right(yy, y0)
+        iy_hi = bisect_left(yy, y1)
+        if iy_lo < iy_hi:
+            ix_lo = max(0, bisect_right(xx, x0) - 1)
+            ix_hi = min(nx_len - 1, bisect_left(xx, x1))
+            if ix_lo < ix_hi:
+                mask = ((1 << (ix_hi - ix_lo)) - 1) << ix_lo
+                for yi in range(iy_lo, iy_hi):
+                    h_block[yi] |= mask
+        ix_lo_v = bisect_right(xx, x0)
+        ix_hi_v = bisect_left(xx, x1)
+        if ix_lo_v < ix_hi_v:
+            iy_lo_v = max(0, bisect_right(yy, y0) - 1)
+            iy_hi_v = min(ny_len - 1, bisect_left(yy, y1))
+            if iy_lo_v < iy_hi_v:
+                mask = ((1 << (iy_hi_v - iy_lo_v)) - 1) << iy_lo_v
+                for xi in range(ix_lo_v, ix_hi_v):
+                    v_block[xi] |= mask
+
+    v_in_cell = [[] for _ in range(max(nx_len - 1, 0))]
+    h_in_cell = [[] for _ in range(max(ny_len - 1, 0))]
+    if occupied:
+        x_idx = {x: i for i, x in enumerate(xx)}
+        y_idx = {y: i for i, y in enumerate(yy)}
+        for row_y, segs in h_rows:
+            yi = y_idx.get(row_y)
+            if yi is not None:
+                for c, d in segs:
+                    cx0, cx1 = (c[0], d[0]) if c[0] <= d[0] else (d[0], c[0])
+                    ix_lo = max(0, bisect_left(xx, cx0) - 1)
+                    ix_hi = min(nx_len - 1, bisect_right(xx, cx1))
+                    if ix_lo < ix_hi:
+                        h_block[yi] |= ((1 << (ix_hi - ix_lo)) - 1) << ix_lo
+            # Pre-index this row into y-intervals [yy[yi], yy[yi+1]] it can cross/touch
+            iy_start = max(0, bisect_left(yy, row_y) - 1)
+            iy_stop = min(ny_len - 1, bisect_right(yy, row_y))
+            for yi in range(iy_start, iy_stop):
+                h_in_cell[yi].extend(segs)
+        for col_x, segs in v_cols:
+            xi = x_idx.get(col_x)
+            if xi is not None:
+                for c, d in segs:
+                    cy0, cy1 = (c[1], d[1]) if c[1] <= d[1] else (d[1], c[1])
+                    iy_lo = max(0, bisect_left(yy, cy0) - 1)
+                    iy_hi = min(ny_len - 1, bisect_right(yy, cy1))
+                    if iy_lo < iy_hi:
+                        v_block[xi] |= ((1 << (iy_hi - iy_lo)) - 1) << iy_lo
+            ix_start = max(0, bisect_left(xx, col_x) - 1)
+            ix_stop = min(nx_len - 1, bisect_right(xx, col_x))
+            for xi in range(ix_start, ix_stop):
+                v_in_cell[xi].extend(segs)
+
     first = (bisect_left(xx, start[0]), bisect_left(yy, start[1]), 0)
     target = (bisect_left(xx, end[0]), bisect_left(yy, end[1]))
+    target_x, target_y = target
     dist, parent = {first: 0.0}, {}
     queue = [(0.0, 0.0, first)]
+    inf = float("inf")
+    stride_h = max(nx_len - 1, 1)
+    h_cache = [-1.0] * (ny_len * stride_h) if occupied else None
+    stride_v = max(ny_len - 1, 1)
+    v_cache = [-1.0] * (nx_len * stride_v) if occupied else None
 
-    @lru_cache(maxsize=None)
-    def cost(x, y, nx, ny):
-        a, b = (xx[x], yy[y]), (xx[nx], yy[ny])
-        if any(crosses_box(a, b, box) for box in boxes):
-            return float("inf")
-        if a[1] == b[1]:
-            local = list(h_by_row.get(a[1], ())) + in_range(v_cols, v_xs, a[0], b[0])
-        else:
-            local = list(v_by_col.get(a[0], ())) + in_range(h_rows, h_ys, a[1], b[1])
+    def occ_edge_cost(a, b, local, ax_len):
         crossings = 0
+        end_touch = a == start or a == end or b == start or b == end
         for c, d in local:
             rel = segment_relation(a, b, c, d)
+            if not rel:
+                continue
             if rel == "overlap":
-                return float("inf")
+                return inf
             if rel == "touch" and (segment_relation(c, c, a, b) or segment_relation(d, d, a, b)):
-                return float("inf")          # never through a node or bend of another net
-            if rel and (a in (start, end) or b in (start, end)):
-                if segment_relation(start, start, c, d) or segment_relation(end, end, c, d):
-                    return float("inf")      # endpoints must not land on another net
-            crossings += bool(rel)
-        return abs(a[0] - b[0]) + abs(a[1] - b[1]) + crossings * 90
+                return inf
+            if end_touch and (segment_relation(start, start, c, d) or segment_relation(end, end, c, d)):
+                return inf
+            crossings += 1
+        return ax_len + crossings * 90
 
+    heappop, heappush = heapq.heappop, heapq.heappush
+    dist_get = dist.get
+    end_x, end_y = end
     while queue:
-        _, d0, cur = heapq.heappop(queue)
-        if d0 != dist.get(cur):
+        _, d0, cur = heappop(queue)
+        if d0 != dist_get(cur):
             continue
         x, y, direction = cur
-        if (x, y) == target:
+        if x == target_x and y == target_y:
             pts = []
             while True:
                 pts.append((xx[cur[0]], yy[cur[1]]))
@@ -167,14 +221,78 @@ def route(start, end, obstacles, *, occupied=None, dense=0):
                     break
                 cur = parent[cur]
             return simplify(pts[::-1])
-        for nx, ny, nd in ((x - 1, y, 1), (x + 1, y, 1), (x, y - 1, 2), (x, y + 1, 2)):
-            if not (0 <= nx < len(xx) and 0 <= ny < len(yy)):
-                continue
-            new = (nx, ny, nd)
-            value = d0 + cost(x, y, nx, ny) + (18 if direction and direction != nd else 0)
-            if value < dist.get(new, float("inf")):
-                dist[new], parent[new] = value, cur
-                heapq.heappush(queue, (value + abs(xx[nx] - end[0]) + abs(yy[ny] - end[1]), value, new))
+        turn_h = 18.0 if direction and direction != 1 else 0.0
+        turn_v = 18.0 if direction and direction != 2 else 0.0
+        h_row_mask = h_block[y]
+        v_col_mask = v_block[x]
+        yy_y = yy[y]
+        xx_x = xx[x]
+        # Horizontal neighbors: (x-1, y) via edge x-1, (x+1, y) via edge x
+        if x > 0 and not ((h_row_mask >> (x - 1)) & 1):
+            ex = x - 1
+            if h_cache is not None:
+                idx = y * stride_h + ex
+                w = h_cache[idx]
+                if w < 0.0:
+                    local = v_in_cell[ex]
+                    w = (xx_x - xx[ex]) if not local else occ_edge_cost((xx[ex], yy_y), (xx_x, yy_y), local, xx_x - xx[ex])
+                    h_cache[idx] = w
+            else:
+                w = xx_x - xx[ex]
+            val = d0 + w + turn_h
+            if val < dist_get((ex, y, 1), inf):
+                new = (ex, y, 1)
+                dist[new], parent[new] = val, cur
+                heappush(queue, (val + abs(xx[ex] - end_x) + abs(yy_y - end_y), val, new))
+        if x + 1 < nx_len and not ((h_row_mask >> x) & 1):
+            nx_i = x + 1
+            if h_cache is not None:
+                idx = y * stride_h + x
+                w = h_cache[idx]
+                if w < 0.0:
+                    local = v_in_cell[x]
+                    w = (xx[nx_i] - xx_x) if not local else occ_edge_cost((xx_x, yy_y), (xx[nx_i], yy_y), local, xx[nx_i] - xx_x)
+                    h_cache[idx] = w
+            else:
+                w = xx[nx_i] - xx_x
+            val = d0 + w + turn_h
+            if val < dist_get((nx_i, y, 1), inf):
+                new = (nx_i, y, 1)
+                dist[new], parent[new] = val, cur
+                heappush(queue, (val + abs(xx[nx_i] - end_x) + abs(yy_y - end_y), val, new))
+        # Vertical neighbors: (x, y-1) via edge y-1, (x, y+1) via edge y
+        if y > 0 and not ((v_col_mask >> (y - 1)) & 1):
+            ey = y - 1
+            if v_cache is not None:
+                idx = x * stride_v + ey
+                w = v_cache[idx]
+                if w < 0.0:
+                    local = h_in_cell[ey]
+                    w = (yy_y - yy[ey]) if not local else occ_edge_cost((xx_x, yy[ey]), (xx_x, yy_y), local, yy_y - yy[ey])
+                    v_cache[idx] = w
+            else:
+                w = yy_y - yy[ey]
+            val = d0 + w + turn_v
+            if val < dist_get((x, ey, 2), inf):
+                new = (x, ey, 2)
+                dist[new], parent[new] = val, cur
+                heappush(queue, (val + abs(xx_x - end_x) + abs(yy[ey] - end_y), val, new))
+        if y + 1 < ny_len and not ((v_col_mask >> y) & 1):
+            ny_i = y + 1
+            if v_cache is not None:
+                idx = x * stride_v + y
+                w = v_cache[idx]
+                if w < 0.0:
+                    local = h_in_cell[y]
+                    w = (yy[ny_i] - yy_y) if not local else occ_edge_cost((xx_x, yy_y), (xx_x, yy[ny_i]), local, yy[ny_i] - yy_y)
+                    v_cache[idx] = w
+            else:
+                w = yy[ny_i] - yy_y
+            val = d0 + w + turn_v
+            if val < dist_get((x, ny_i, 2), inf):
+                new = (x, ny_i, 2)
+                dist[new], parent[new] = val, cur
+                heappush(queue, (val + abs(xx_x - end_x) + abs(yy[ny_i] - end_y), val, new))
     raise ValueError(f"no obstacle-free path from {start} to {end}")
 
 
@@ -290,26 +408,67 @@ def route_island(conns, obstacles, boxes, occupied_other):
                     cands.setdefault(p, []).append((_manhattan(esc[p], cand), ei, si, cand))
         # Attach the pin nearest to the existing wire first; among its nearest access points, route for real and take the cheapest in length, turns and crossings
         p = min(cands, key=lambda k: min(c[0] for c in cands[k]))
-        options, seen = [], set()
-        for c in sorted(cands[p]):
-            if c[3] not in seen:
-                seen.add(c[3])
-                options.append(c)
-        best = None
-        for _, ei, si, t in options[:4]:
-            try:
-                tail = route(esc[p], t, obstacles, occupied=occupied_other + own_segments(exclude=t))
-            except ValueError:
-                continue
-            cost = _path_cost([pin_pt[p], *tail], occupied_other)
-            if best is None or cost < best[0]:
-                best = (cost, ei, si, t, tail)
+        all_own = own_segments()
+
+        def try_attach(ep_p, dense_flag, max_opts):
+            if ep_p != pin_pt[p]:
+                owner = conns[p].get("refdes")
+                if any(o.get("owner", o.get("refdes")) != owner and crosses_box(pin_pt[p], ep_p, rectangle(o)) for o in obstacles):
+                    return None
+                if any(segment_relation(pin_pt[p], ep_p, c, d) == "overlap" for c, d in occupied_other + all_own):
+                    return None
+            pts_by_t, seen_t = [], set()
+            if ep_p == esc[p]:
+                raw_opts = cands[p]
+            else:
+                raw_opts = []
+                for ei, e in enumerate(edges):
+                    pts = e["path"]
+                    last = len(pts) - 2
+                    for si in range(len(pts) - 1):
+                        a, b = pts[si], pts[si + 1]
+                        if si == 0 and e["a"][0] == "pin":
+                            ea = esc[e["a"][1]]
+                            a = ea if _on_segment(ea, a, b) else b
+                        if si == last and e["b"][0] == "pin":
+                            eb = esc[e["b"][1]]
+                            b = eb if _on_segment(eb, a, b) else a
+                        cand = _closest_on_segment(a, b, ep_p)
+                        raw_opts.append((_manhattan(ep_p, cand), ei, si, cand))
+            for c in sorted(raw_opts):
+                if c[3] not in seen_t:
+                    seen_t.add(c[3])
+                    pts_by_t.append(c)
+            found = None
+            for _, ei, si, t in pts_by_t[:max_opts]:
+                occ = occupied_other + [s for s in all_own if not _on_segment(t, *s)]
+                try:
+                    tail = route(ep_p, t, obstacles, occupied=occ, dense=dense_flag)
+                except ValueError:
+                    continue
+                cost = _path_cost([pin_pt[p], *tail], occupied_other)
+                if found is None or cost < found[0]:
+                    found = (cost, ei, si, t, tail, ep_p)
+            return found
+
+        best = try_attach(esc[p], 0, 4)
         if best is None:
+            for clearance in (9, 18, 27, 40):
+                ep_p = esc[p] if clearance == 9 else pin_escape(conns[p], boxes, clearance)
+                for dense_flag in ((1,) if clearance == 9 else (0, 1)):
+                    best = try_attach(ep_p, dense_flag, 3)
+                    if best is not None:
+                        break
+                if best is not None:
+                    break
+        if best is None:
+            options = sorted({c[3]: c for c in cands[p]}.values())
             _, ei, si, t = options[0]
             tail = _elbow(esc[p], t)
             failures.append(f"pin {p}: no obstacle-free path to the existing wire")
         else:
-            _, ei, si, t, tail = best
+            _, ei, si, t, tail, ep_p = best
+            esc[p] = ep_p
         new_path = simplify([pin_pt[p], *tail])
         e = edges[ei]
         pts = e["path"]
@@ -361,19 +520,20 @@ def route_all(connections, boxes, labels=()):
 
     islands.sort(key=span)
 
+    base_obstacles = list(boxes) + list(labels)
+    pin_boxes = []
+    for other in connections.values():
+        for pin in other:
+            ex, ey = pin_escape(pin, boxes)
+            px, py = float(pin["x"]), float(pin["y"])
+            pin_boxes.append((id(pin), {"refdes": "__pin__", "x": min(px, ex) - 3, "y": min(py, ey) - 3,
+                                       "width": abs(px - ex) + 6, "height": abs(py - ey) + 6}))
+
     def one_pass(order):
         result, occupied, failures = [], [], []
         for name, conns in order:
             mine = {id(c) for c in conns}
-            obstacles = list(boxes) + list(labels)
-            for other in connections.values():          # leave escape channels for the other pins
-                for pin in other:
-                    if id(pin) in mine:
-                        continue
-                    ex, ey = pin_escape(pin, boxes)
-                    px, py = float(pin["x"]), float(pin["y"])
-                    obstacles.append({"refdes": "__pin__", "x": min(px, ex) - 3, "y": min(py, ey) - 3,
-                                      "width": abs(px - ex) + 6, "height": abs(py - ey) + 6})
+            obstacles = base_obstacles + [b for pid, b in pin_boxes if pid not in mine]
             edges, junctions, fb = route_island(conns, obstacles, boxes, occupied)
             failures += [{"net": name, "reason": reason} for reason in fb]
             for e in edges:
@@ -392,6 +552,8 @@ def route_all(connections, boxes, labels=()):
             best = (result, failures)
         if not failures:
             return result, []
+        if attempt == 1 and len(failures) == 1 and order and order[0][0] == failures[0]["net"] and sum(1 for n, _ in order if n == failures[0]["net"]) == 1:
+            break                              # sole failing island already failed even with zero prior wires
         failed = {f["net"] for f in failures}
         order = [i for i in order if i[0] in failed] + [i for i in order if i[0] not in failed]
         if attempt == 1:

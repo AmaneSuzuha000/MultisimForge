@@ -137,3 +137,30 @@ def test_mcp_run_cli_blocks_destructive_subcommands():
     for command in ("com", "parts", ""):
         assert module._blocked([command] if command else []), command
     assert module._blocked(["check", "a.ms14"]) == ""
+
+
+def test_mcp_write_confinement_returns_structured_blocked_payload(monkeypatch, tmp_path):
+    """MCP SDK hides unhandled exceptions behind a generic string, so confinement must return structured JSON."""
+    import asyncio
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("adapter_server_policy", ROOT / "mcp_adapter" / "server.py")
+    if spec is None or spec.loader is None:
+        pytest.skip("adapter not importable")
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        pytest.skip(f"adapter needs the mcp package: {exc}")
+
+    monkeypatch.setenv("MULTISIMFORGE_MCP_OUTPUT_ROOT", str(tmp_path))
+    monkeypatch.delenv("MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES", raising=False)
+    blocked_build = asyncio.run(module.build_schematic({"netlist": "R1 a 0 1k\n", "output": "out/escape.ms14", "layout": {}}))
+    assert blocked_build["ok"] is False
+    assert blocked_build["blocked"] is True
+    assert "confined" in blocked_build["error"]
+
+    blocked_parts = asyncio.run(module.parts("fetch", "1N4007"))
+    assert blocked_parts["ok"] is False
+    assert blocked_parts["blocked"] is True
+    assert "MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES" in blocked_parts["error"]
