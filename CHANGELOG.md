@@ -4,35 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - reliability and audit hardening
+## [0.1.7] - 2026-11-12
 
-- Fixed two unsafe COM replay paths (including daemon business errors and transport
-  disconnects after submission), atomic daemon state writes, case-insensitive
-  Multisim PID detection, and cleanup of daemon-owned orphaned `multisim.exe`
-  processes on abnormal disconnect (`com.py`).
-- Populated `<RefDesPrefixUsageMap>` and exact `RefDesStrSize` in `builder.py`
-  and relocated ASCII carrier staging in `parts fetch`, eliminating the
-  deterministic `0xC0000374` COM `ReplaceComponent` crashes across analog, power,
-  opamp, timer, TTL, and CMOS parts, while extending restart/recovery to
-  `JobIndeterminate` disconnects.
-- Fixed real Multisim 14.3 COM `sections` queries to call `EnumSections` with
-  component existence validation, and returned structured `blocked: True` payloads
-  for policy-denied MCP tool calls under `mcp>=2.3.0`.
-- Offline checker now identifies wires with only one unattached endpoint, scopes
-  analysis to the primary `CIITDiagram`, handles animation symbols and same-named
-  `CiNode` groups, distinguishes hidden power pins from visible pin labels, and
-  improves performance and accuracy in routing and auto-repair.
-- DCL decoder/encoder validate zero/oversized/truncated bitstreams and improve
-  `implode`/`explode` throughput while preserving exact sample round-trips.
-- Probe injection avoids ID and refdes/output-variable collisions on already-probed
-  schematics and rejects ground-only measurement targets.
-- Hardened `access.safe_escape_command` against repeated `--debug` prefixes, scoped
-  MCP output writes, and denied mutating `run_cli` / library actions by default.
-- Added measured numerical CSV cursors (`cursors`), read-only `sections` query,
-  foreground-free `PrintWindow` montage (`imaging.py`), opt-in `--desktop-screen`,
-  English & Chinese netlist-dialog handling, and GUI exception cleanup.
-- Corrected cross-platform `python32` configuration test and XML/parts edge cases.
-- Warn on section-A-only use of multi-section part templates.
+Reliability, multi-section packages, zero-Node ADODB database indexing, and closed-loop
+background GUI cursor automation release.
+
+### Added
+
+- **Full multi-section IC and dual-device support (`U1.A`/`U1.B`/`U1B`):**
+  - `netlist.py` adds `split_section_ref` and supports named `pin=net` syntax on `DQJM`
+    multi-section parts (e.g. `D1.A MMBD7000LT1 A=in1 K/A=dmid`) in addition to positional syntax.
+  - `parts.py` extracts per-section pinouts, section names, `COM` shared pins, conditional
+    digital/analog SPICE template rewrites (preserving series dual-diode anode-cathode polarity
+    and harvested 3-pin subcircuit arity), and `db_sections.json`.
+  - `builder.py` serializes multi-section slots into shared physical packages with automatic
+    shared `COM` net inheritance, conflict detection, deduplication, `CIRToInfoMapItem`
+    (`PinOrderCIR`/`PinOrderIR`/`PinNumbersCIR`/`PinNumbersIR`), and full
+    `RefDesPrefixUsageMap` `MultisectionUsage`. Verified natively on Multisim 14.3 with
+    COM `EnumSections` and DC OP (`LM324AJ` `U1.A`/`U1.B` + `MMBD7000LT1` `D1.A`/`D1.B` + `7404N`).
+  - `check.py` is section-aware (`(name, section)` refdes tracking, `inspect` `"package"`/`"section"`).
+- **Pure-Python Jet3/Jet4 header decryption & 32-bit ADODB `parts dbindex`:** reads
+  `MSCOMP_S.PRD` (56,980 components + 14,004 multi-section definitions) on Windows without
+  requiring Node.js, keeping Node as fallback (`parts.py`).
+- **Opt-in closed-loop background GUI cursor positioning & non-activating launch:**
+  `capture --cur1/--cur2` (CLI & MCP `capture_instruments`) launches non-activating
+  (`SW_SHOWNOACTIVATE`) and positions physical oscilloscope T1/T2 and Bode frequency cursors
+  via Win32 background canvas/button messages with two-point calibration and live static
+  UI readout verification (`verified_by_ui_readout: true`).
+- **Hardened routing & failing-net-first layout repair:** `router.py` escalates pin escape
+  up to 54 units and adds a 4th rip-up-and-retry ordering; `builder.py` prioritizes
+  components on failing nets first during auto-repair.
+- New unit, integration, and routing matrix tests in `tests/test_multisection.py`,
+  `tests/test_dbindex_jet.py`, `tests/test_capture_cursors.py`, and `tests/test_routing_matrix.py`.
+
+### Fixed
+
+- Fixed `.MODEL`/`.SUBCKT` comment-headed card renaming on repeated part instances (`builder.py`)
+  and stripped stale embedded refdes lines (`LM324AJ\nU1`) from `CIITSymTextCompValue.Output`.
+- Fixed `Builder.place(..., ground=True)` using unique `GND1`/`GND2` display designators so
+  multiple ground connections no longer collide inside router pin-escape checks.
+- Fixed `capture.run_once` single-argument call compatibility for non-`desktop_screen` calls
+  and hardened Win32 enumeration callbacks against destroyed window handles (`pywintypes.error`).
+- Fixed two unsafe COM replay paths, atomic daemon state writes, case-insensitive PID
+  cleanup (`com.py`), `2N3904` ASCII-path carrier staging (`parts fetch`), DCL bounds
+  validation (`codec.py`), probe ID/ground guards (`sim.py`), and MCP confinement (`access.py`).
 
 ## [0.1.6] - 2026-10-31
 

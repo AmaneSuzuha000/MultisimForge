@@ -64,14 +64,52 @@ class Circuit:
         self.symbols = {k: it for k, it in self.items.items()
                         if it.get("Class") in ("CIITSymbolComp", "CIITAnimationSymbolComp")}
         self.wires = {k: it for k, it in self.items.items() if it.get("Class") == "CIITLinkComp"}
+        # Prefer CIITSymbolComp over CIITAnimationSymbolComp if both represent one CiComponent.
+        self.sym_by_comp = {}
+        for sym in self.symbols.values():
+            cid = sym[0].get("CiComponent")
+            if not cid:
+                continue
+            if cid not in self.sym_by_comp or sym.get("Class") == "CIITSymbolComp":
+                self.sym_by_comp[cid] = sym
+        name_counts = defaultdict(int)
+        for it in self.comps.values():
+            nm = xmlio.unasc(it[0].get("LocalName"))
+            if nm:
+                name_counts[nm] += 1
+        self._name_counts = name_counts
 
     def comp_name(self, comp_id):
         it = self.comps.get(comp_id)
         return xmlio.unasc(it[0].get("LocalName")) if it is not None else "?"
 
+    def comp_section(self, comp_id) -> str:
+        sym = self.sym_by_comp.get(comp_id)
+        return xmlio.unasc(sym[0].get("IRSection") or "") if sym is not None else ""
+
+    def comp_is_multisection(self, comp_id) -> bool:
+        sym = self.sym_by_comp.get(comp_id)
+        if sym is None:
+            return False
+        sec = xmlio.unasc(sym[0].get("IRSection") or "")
+        if int(sym[0].get("NumSections") or 1) > 1 and sec:
+            return True
+        name = self.comp_name(comp_id)
+        return bool(sec) and self._name_counts.get(name, 0) > 1
+
+    def comp_label(self, comp_id) -> str:
+        name = self.comp_name(comp_id)
+        if name in ("", "0", "?"):
+            return name
+        if self.comp_is_multisection(comp_id):
+            sec = self.comp_section(comp_id)
+            if sec and not name.endswith(sec):
+                return name + sec
+        return name
+
     def port_label(self, port_id):
         port = self.ports[port_id][0]
-        return f"{self.comp_name(port.get('Component'))}.{xmlio.unasc(port.get('LocalName'))}"
+        return f"{self.comp_label(port.get('Component'))}.{xmlio.unasc(port.get('LocalName'))}"
 
     def electrical_nets(self) -> dict:
         """{net name: {component.pin, ...}} (ground symbols are not included; same-named nodes merge)."""
@@ -107,19 +145,20 @@ class Circuit:
         return out
 
     def refdes_counts(self) -> dict:
-        """{refdes: times it appears on the sheet}; a real design never repeats one.
+        """{refdes_slot: times it appears on the sheet}; distinct sections of one package (e.g. U1A, U1B) get distinct slots.
 
         Ground symbols ("0"), repeated power supply symbols, and on-page connectors are skipped.
         """
         counts = {}
-        for it in self.comps.values():
+        for cid, it in self.comps.items():
             ident = identity(it[0])
             if ident is None or ident[1] == "POWER_SOURCES" or ident[2] == "ground":
                 continue
             name = xmlio.unasc(it[0].get("LocalName"))
             if name in ("", "0"):
                 continue
-            counts[name] = counts.get(name, 0) + 1
+            key = self.comp_label(cid) if self.comp_is_multisection(cid) else name
+            counts[key] = counts.get(key, 0) + 1
         return counts
 
     def dangling_wires(self):
@@ -223,23 +262,15 @@ def check_root(root, expected: dict | None = None, source="<memory>") -> dict:
     warnings = []
     width = float(diagram.get("PageWidth", "11")) * 96
     height = float(diagram.get("PageHeight", "8.5")) * 96
-    # Prefer CIITSymbolComp over CIITAnimationSymbolComp if both represent one CiComponent.
-    sym_by_comp = {}
-    for sym in c.symbols.values():
-        cid = sym[0].get("CiComponent")
-        if not cid:
-            continue
-        if cid not in sym_by_comp or sym.get("Class") == "CIITSymbolComp":
-            sym_by_comp[cid] = sym
     boxes = {}
-    for cid, sym in sym_by_comp.items():
+    for cid, sym in c.sym_by_comp.items():
         comp = c.comps.get(cid)
         if comp is None:
             continue
         box = symbol_bbox(sym)
         if box is None:
             continue
-        name = xmlio.unasc(comp[0].get("LocalName"))
+        name = c.comp_label(cid)
         if name == "0":
             base = f"GND@{box[0]:.0f},{box[1]:.0f}"
         elif not name or name in boxes:
@@ -331,7 +362,7 @@ def inspect(path) -> dict:
         "INDUCTOR_VIRTUAL", "RESISTOR", "CAPACITOR", "INDUCTOR",
         "DC_POWER", "DC_CURRENT", "AC_VOLTAGE",
     }
-    for it in c.comps.values():
+    for cid, it in c.comps.items():
         comp = it[0]
         ident = identity(comp)
         name = xmlio.unasc(comp.get("LocalName"))
@@ -342,7 +373,11 @@ def inspect(path) -> dict:
         if plist is not None and (ident[0] in _valued_parts or ident[1] in ("RESISTORS_VIRTUAL", "CAPACITORS_VIRTUAL", "INDUCTORS_VIRTUAL")):
             params = plist.findall("./parameters/Item")
             value = xmlio.unasc(params[1].get("Value")) if len(params) > 1 else None
-        comps.append({"refdes": name, "part": ident[0], "family": ident[1], "value": value})
+        entry = {"refdes": c.comp_label(cid), "part": ident[0], "family": ident[1], "value": value}
+        if c.comp_is_multisection(cid):
+            entry["package"] = name
+            entry["section"] = c.comp_section(cid)
+        comps.append(entry)
     instruments = {}
     for node in root.iter("CSourceSymbolCollectNode"):
         long_name = xmlio.unasc(node.get("CompLongName") or "")

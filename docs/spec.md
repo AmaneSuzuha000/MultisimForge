@@ -33,10 +33,11 @@
 | sine source | `V1 vin 0 DC 0 AC 1 SIN(0 <peak> <freq>)` | `AC 1` is required for AC sweeps and bode plots |
 | pulse source | `V1 vin 0 PULSE(<low> <high> <delay> <rise> <fall> <width> <period>)` | `AC 1` may be added |
 | DC current source | `I1 a b DC 1m` | |
-| diode | `D1 a k 1N4148` | anode, cathode |
-| BJT | `Q1 c b e 2N3904` | collector, base, emitter |
+| diode | `D1 a k 1N4148` or `D1.A MMBD7000LT1 A=a K/A=m` | anode, cathode (or named pin=net for multi-section dual diodes) |
+| BJT | `Q1 c b e 2N3904` | collector, base, emitter (also accepts named `C=... B=... E=...`) |
 | MOSFET | `M1 d g s b <model>` | |
 | library part, positional | `XU1 inp inn vp vn out LM324AJ` | in `parts show` pin order; the leading X is dropped (shown as U1A) |
+| library part, multi-section | `U1.A LM324AJ 1IN+=in1 1IN-=outa VS+=vcc VS-=0 1OUT=outa`, `U1.B LM324AJ 2IN+=outa 2IN-=mid 2OUT=outb` | dotted (`U1.B`) or compact (`U1B`) section refs share one physical package; shared `COM` pins (e.g. `VS+`/`VS-`) are auto-inherited across sections and checked for conflicts |
 | library part, named pins | `U1 LM555CN GND=0 TRI=thr OUT=out RST=vcc CON=con THR=thr DIS=dis VCC=vcc` | use this when a part has many pins; hidden power pins can be rewired the same way |
 | oscilloscope | `XSC1 <A+> <B+> <A-> <T+> <B-> <T-> OSCILLOSCOPE` | tie A- and B- to 0; give unused external-trigger pins a unique net name (nc1, nc2) |
 | function generator | `XFG1 <+> <COM> <-> FGEN WAVE=SQUARE FREQ=1k AMPLITUDE=2 OFFSET=0 DUTY=50` | WAVE: SINE/TRIANGLE/SQUARE; AMPLITUDE is the peak value; COM goes to ground |

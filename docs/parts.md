@@ -6,16 +6,17 @@ A part inside a `.ms14` is not one object but several: the electrical component 
 
 The library lives in `%LOCALAPPDATA%\multisimforge\parts\`:
 
-- `index.json` — name → family, pin order, hidden power pins, SPICE template, source
+- `index.json` — name → family, pin order, hidden power pins, multi-section metadata (`section_names`, `shared_pins`, `section_pins`), SPICE template, source
 - `<name>.xml` — the part template
 - `_struct\` — structural templates extracted from a blank design (drawing shell, wire, external pin, junction, net, net label, voltage probe, simulation settings)
-- `db_index.json` — `{part name: [group, family]}` for the Multisim master database (used by `parts fetch`)
+- `db_index.json` — `{part name: [group, family]}` for the Multisim master database (`MSCOMP_S.PRD`), extracted via pure-Python Jet3/4 header decryption + 32-bit ADODB on Windows (`tools/dbindex.js` kept as Node fallback)
+- `db_sections.json` — per-section symbol pinouts & SPICE templates for multi-section parts in `MSCOMP_S.PRD`
 
 ## Adding parts
 
-1. **`parts fetch <model>` (preferred)**: look up group and family in `db_index.json`, replace a part in a carrier design via COM `ReplaceComponent`, save, then harvest. The carrier must be compatible with the target or the Multisim process crashes, so the tool tries a transistor carrier (analog: op-amps, 555, diodes, transistors) and a 7404N carrier (TTL/CMOS logic) in turn. Crashes are cleaned up and later calls are unaffected.
+1. **`parts fetch <model>` (preferred)**: look up group and family in `db_index.json`, replace a part in a single-section `2N3904` carrier (with populated `RefDesPrefixUsageMap` and ASCII relocated copy) via COM `ReplaceComponent`, save, then harvest. Crashed unsupported categories (e.g. `Basic/3D_VIRTUAL`) are cleaned up and retried once safely without affecting pre-existing sessions.
 2. **`parts harvest <file-or-dir>`**: place the part in Multisim, save, then harvest. Existing names are skipped unless `--force` is given (single files only).
-3. **`parts init`**: rebuild the entire library (structural templates plus the ~230 parts found in the samples shipped with Multisim). Needs Multisim and COM.
+3. **`parts init`**: rebuild the entire library (structural templates plus the ~202+ parts found in the samples shipped with Multisim). Needs Multisim and COM.
 
 Use the full database name, e.g. `LM555CN`, `74LS00N`, `UA741CD`, `2N2222A`. If you do not know it, the error from `parts fetch` lists nearby names.
 
@@ -24,7 +25,7 @@ Use the full database name, e.g. `LM555CN`, `74LS00N`, `UA741CD`, `2N2222A`. If 
 - `pins` is the positional order used by the netlist: it follows the `%t<pin name>` order in the SPICE template, matching SPICE convention (diode A K, BJT C B E, LM324AJ 1IN+ 1IN- VS+ VS- 1OUT).
 - Instrument ports are numbered; the meaning is annotated in `parts show` (scope 1=A+, 4=A-, 2=B+, 5=B-, 3/6=external trigger).
 - `hidden_pins` are power pins that are not drawn (VCC/GND on 74-series parts); they default to the nets of the same name. Use named-pin syntax to rewire, e.g. `VCC=vcc5`.
-- Multi-section parts (four op-amps in an LM324, four NAND gates in a 74LS00) use section A per instance; designators show as U1A, U2A, ...
+- Multi-section parts (quad op-amps in an `LM324AJ`, dual series diodes in `MMBD7000LT1`, hex/quad logic in `7404N`/`74LS00`) support sections `A..F` via `U1.A`/`U1.B` or `U1A`/`U1B` sharing one physical package, with per-section pins, templates, `CIRToInfoMapItem`, and automatic inheritance & conflict checks on shared `COM` pins.
 
 ## Local paths (defaults in config.py, override with config.json)
 

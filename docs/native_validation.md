@@ -25,127 +25,70 @@ stop and file the first reproducible failure. Never turn a skipped test into PAS
 
 ## 1. Physical scope and Bode cursors
 
-**Established limitation:** the saved design stores cursor positions, but Multisim
-14.3 resets them to zero when reopening a design. Neither serialised cursor
-attributes nor the known RestoreData flag restored them in prior experiments.
+**Vendor `.ms14` persistence limitation (still true):** the saved `.ms14` file carries cursor
+attributes, but Multisim 14.3 resets them to zero whenever a design is reopened.
 
-**Working alternative:** `sim --csv` followed by `cursors` reports readings
-interpolated from *real* simulator data, clearly marked `not_gui_cursors`.
+**Resolved measurements & opt-in background GUI cursor control:**
+- Numerical `sim --csv` + `cursors` interpolates from real simulator CSV samples
+  (`not_gui_cursors: true`).
+- For live instrument screenshots (`capture --cur1 <val> [--cur2 <val>]`), `capture.py`
+  now moves physical oscilloscope T1/T2 and Bode frequency cursors via background Win32
+  canvas messages (`WM_LBUTTONDOWN`/`WM_MOUSEMOVE`/`WM_LBUTTONUP`, `BM_CLICK`), closed-loop
+  two-point handle calibration, and live static UI readout verification
+  (`verified_by_ui_readout: true`, `method: "win32_background_messages"`).
+- Natively verified on Multisim 14.3: Scope `T1=1.5ms`/`T2=3.5ms` settled at
+  `1.496 ms` / `3.499 ms` (`T2-T1 = 2.003 ms`) and Bode `1kHz` settled at
+  `1 kHz` (`-1.445 dB`) without stealing desktop focus.
 
-**Native UI lead:** NI documents Grapher's `Cursor > Set X value` dialog:
-https://www.ni.com/docs/en-US/bundle/multisim/page/topics/grapher-cursor-menu.html .
-This is a Grapher interaction, not proof that virtual instrument cursor state
-survives a file reopen.
+## 2. Multi-section packages (`LM324AJ`, `MMBD7000LT1`, `7404N`)
 
-**Native experiments before any UI-control attempt:**
-1. Make an original scope and Bode example with visible T1/T2 and F1/F2 positions.
-2. Save, close, reopen, and inspect both the GUI and the stored XML fields.
-3. Move cursors using a human operator; inspect Windows UI Automation accessible
-   objects and messages for those widgets. Avoid undocumented writes to original
-   projects or arbitrary address injection.
-4. If automation is possible, write a separate opt-in GUI adapter with explicit
-   position verification after each action; otherwise retain numerical cursors.
-
-**Gate:** never label a virtual/CSV cursor reading as a screenshot of a physical
-NI GUI cursor. Raw waveform samples must remain accessible.
-
-## 2. Multi-section packages (LM324, 74LS00)
-
-**Current limit:** harvested template carries section metadata, but the builder
-places only section A. Another instance is not automatically another section of
-the same physical package. This is now surfaced as a build warning.
-
-**Native API lead:** NI documents the read-only `List Sections` capability
-(exposed on Multisim 14.3's `IMultisimCircuit` COM object as `EnumSections`),
-which enumerates already-used top-level sections of a package:
-https://www.ni.com/docs/en-US/bundle/multisim/page/topics/list-sections.html .
-Run `multisimforge sections test.ms14 U1` against Multisim-authored fixtures
-before implementing any package-creation logic.
-
-**Native evidence required for implementation:**
-1. In Multisim, create one *package* with two sections (U1A/U1B), then all sections
-   (A-D for LM324). Save both and collect original + decoded XML.
-2. Compare `CiComponent`, `CiPort`, `CIITSymbolComp` / `IRSection`,
-   `CIRToInfoMapItem`, pin IDs, hidden VCC/GND, shared package identity, SPICE
-   model records, and per-section local names.
-3. Construct a fixture with physically shared supply pins and separate section
-   I/O. Run the same AC and transient validation on Multisim-authored and
-   generated circuits; prove port-to-net equality and numerical agreement.
-4. Repeat with a digital multi-section part where shared power pins are hidden.
-5. Implement section-aware package creation only after those fixtures demonstrate
-   the exact native serialisation rules; otherwise reject requested non-A sections.
-
-**Gate:** no PASS for a multi-section package unless all requested sections
-and hidden supply nets match the original native package.
+**Resolved and natively verified on Multisim 14.3:**
+- `builder.py` and `parts.py` (`section_spec`, `db_sections.json` via ADODB) serialize
+  multi-section slots (`U1.A`/`U1.B`/`U1B`) into one physical package (`LocalName="U1"`),
+  remapping per-section `CiComponent`, `CiaSpiceTmpltExprt`, `CIITSymbolComp`
+  (`IRSection`/`IRSectionID`/`DBComponentSectionName`), `CiPort`/`CIITPinSymbolComp`,
+  `CIRToInfoMapItem` (`PinOrderCIR`/`PinOrderIR`/`PinNumbersCIR`/`PinNumbersIR`),
+  `RefDesPrefixUsageMap` (`MultisectionUsage`), and `.MODEL`/`.SUBCKT` rename headers
+  (including comment-headed cards).
+- Shared `COM` pins (e.g. `VS+`/`VS-`, `K/A`) are automatically inherited across sections
+  of the same physical package and rejected on conflict.
+- Natively verified against `Mixed-signal/FrequencyDivider.ms14` and a generated
+  multi-section fixture (`LM324AJ` `U1.A`+`U1.B` + `MMBD7000LT1` `D1.A`+`D1.B` + `7404N`
+  `U2.A`+`U2.B`): `check` `problems=[]`, COM `EnumSections` `['A', 'B']`, and COM DC
+  operating point agreement (`outa=2.002 V`, `outb=4.007 V` with inherited rails, series
+  diode drops `2.000 -> 1.412 -> 0.825 V`).
 
 ## 3. ReplaceComponent process heap corruption
 
-**Observed vendor problem:** some `ReplaceComponent` operations can terminate
-the Multisim process with 0xC0000374. A Python exception handler cannot prevent
-a native heap corruption inside NI's process.
-
-**Empirical root causes identified and mitigated:**
-- **Empty/mismatched `RefDesPrefixUsageMap`:** `builder.finish()` now populates
-  `<RefDesPrefixUsageMap>` (`NumberUsed` aligned to `IRNumber`, plus
-  `MultisectionUsage` for multi-section packages) and matches NI's packed
-  `RefDesStrSize` formula.
-- **Same-path binding & non-ASCII carrier paths:** opening a built carrier at
-  the exact `<CIRToInfoMapItem>` path or inside a non-ASCII directory still
-  provokes 0xC0000374 in Multisim 14.3, as do multi-section harvested carriers
-  (`7404N`). `parts fetch` uses the single-section `2N3904` carrier, stages in
-  an ASCII temporary directory when needed, and opens a relocated copy.
-- **Unsupported vendor categories:** entries such as `Basic/3D_VIRTUAL`
-  (`555_Timer`) still fault inside NI's process; `_replace_with_restart` catches
-  both explicit `0xC0000374` exits and post-submission disconnects
-  (`JobIndeterminate`), cleans up orphaned daemon-owned `multisim.exe` processes
-  (`_cleanup_orphans`), restarts once, and rejects partial outputs without
-  affecting pre-existing user sessions. Prefer locally harvested licensed
-  templates when a category fails repeatedly.
-
-**Native experiments:**
-1. On disposable carriers, test single fresh-session replace, then repeated
-   same-session replace using a frozen model list.
-2. Record PID, stdout/stderr, exit codes, working-file checksums, and restart
-   success/failure. Do not reuse or kill the user's pre-existing Multisim.
-3. Compare fresh-session success rate against reuse, report confidence intervals,
-   and decide whether `parts fetch` must always isolate the risky call in a
-   single-use process.
-4. On an ambiguous disconnect, do **not** replay: a partially completed operation
-   may already have changed a file. Require explicit recovery inspection.
-
-**Gate:** zero unsafe side-effects on pre-existing sessions and no stale-file PASS.
+**Native benchmark results on frozen target list (disposable library, COM reuse):**
+- Single reused COM worker (`PID=13588`) succeeded on **7/7 present database parts**
+  (`LM555CN` 6.65s cold, `UA741CD` 0.82s, `2N2222A` 0.69s, `1N4148` 0.75s, `74LS00N`
+  0.77s, `IRF540N` 0.69s, `TL082CD` 0.83s; ~0.76s warm reuse).
+- Missing catalog names (`CD4011BE`, `NE5532D`) failed cleanly (`0.27s`) leaving the COM
+  worker healthy.
+- Vendor-faulting category (`Basic/3D_VIRTUAL` `555_Timer`) triggered `0xC0000374` inside
+  NI's `ReplaceComponent`; `_replace_with_restart` cleaned up the dead process (`pid=None`),
+  retried once safely, rejected partial outputs, and left zero orphaned `multisim.exe`
+  processes. This vendor-internal fault in unsupported 3D/virtual categories remains an
+  upstream NI limitation; use harvested templates when needed.
 
 ## 4. A* layout and dense routing
 
-Obstacle-aware routing has no universal clean-path guarantee for an arbitrary
-fixed geometry. Some dense layouts are physically impossible without moving
-parts or crossing nets.
-
-**Validation matrix:** open-space, constrained corridor, multiple-net crossing,
-pin escape blocked, same-net branches, 50-200 components, mirrored/rotated
-parts, explicit wire paths, and a non-routable adversarial fixture.
-
-Measure: valid connections, hard errors, overlap count, crossings, wire length,
-number of bends, execution time, peak memory, and nondeterministic variants.
-
-**Gate:** every reported PASS must have zero electrical problems; non-routable
-cases must FAIL rather than drawing through components. Optimise wire aesthetics
-only subject to that constraint.
+Validated across the offline routing matrix (`tests/test_routing_matrix.py`: open space,
+constrained corridor, multi-net crossing, pin escape escalation up to `54` units,
+same-net tree junction branching, 4-pass rip-up-and-retry, 50/100/200 component scale
+benchmarks, mirrored/rotated + explicit `wires`, and non-routable sealed enclosure failing
+explicitly with zero obstacle crossings or net overlaps). Dense fixed geometries without
+physical channel room still intentionally raise `RouteError` (or move parts via
+`auto_repair`) rather than drawing through components.
 
 ## 5. Capture focus and exact provenance
 
-Default capture now supplies independent real PrintWindow panel/circuit bitmaps
-and a **labelled composite**. It no longer requires a desktop screenshot.
-An opt-in `--desktop-screen` still needs foreground.
-
-**Native experiment:** monitor `GetForegroundWindow` before/during/after both
-modes, use partial occlusion tests, handle high-DPI and secondary monitors, and
-verify a netlist error during the screenshot closes only the owned process.
-Launching Multisim may activate it independently of the screenshot code.
-
-**Gate:** the contact sheet must be labelled composite, never misrepresented as
-a raw desktop capture. Preserve raw panels; verify their pixel content against
-the visible instrument state.
+Default `capture` launches `multisim.exe` with `STARTUPINFO(SW_SHOWNOACTIVATE)` and grabs
+real `PrintWindow` panel/circuit bitmaps plus an explicitly labelled `PrintWindow` composite
+without stealing `GetForegroundWindow` during scope/Bode capture or background cursor
+positioning. Only `--desktop-screen` explicitly opts into foreground activation for a full
+desktop grab.
 
 ## Release rule
 

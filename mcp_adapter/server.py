@@ -31,7 +31,7 @@ for sub in ("specs", "captures", "tmp"):
 mcp = MCPServer(
     "multisimforge",
     title="MultisimForge",
-    version="0.1.6",
+    version="0.1.7",
     instructions=(
         "MultisimForge adapter for NI Multisim 14.3. Use check_design for offline "
         "connectivity/layout verification, inspect_design to read an existing .ms14, "
@@ -301,10 +301,13 @@ async def capture_instruments(
     timeout_s: float = 90,
     keep_open: bool = False,
     desktop_screen: bool = False,
+    cur1: str = "",
+    cur2: str = "",
 ) -> dict[str, Any]:
     """Capture real circuit/panel windows and a labelled foreground-free montage.
     desktop_screen=True additionally opts into a real desktop photo that steals
-    focus; by default mouse and keyboard remain free."""
+    focus; by default mouse and keyboard remain free. Optional cur1/cur2 move live
+    GUI cursors on Oscilloscope/Bode panels via background Win32 messages."""
     try:
         target = _assert_write_target(_resolve(outdir) if outdir else (_output_root() / "captures" / f"{Path(ms14).stem}_{_stamp()}"))
     except PermissionError as exc:
@@ -316,6 +319,10 @@ async def capture_instruments(
         args.append("--keep-open")
     if desktop_screen:
         args.append("--desktop-screen")
+    if cur1:
+        args += ["--cur1", str(cur1)]
+    if cur2:
+        args += ["--cur2", str(cur2)]
     result = await asyncio.to_thread(_run_cli, args, timeout_s + 180)
     result["outdir"] = str(target)
     return result
@@ -400,9 +407,9 @@ async def convert_design(src: str, dst: str = "", direction: Literal["decode", "
 @mcp.tool()
 async def parts(action: Literal["list", "show", "harvest", "fetch", "init", "dbindex"], arg: str = "",
                 force: bool = False, group: str = "", family: str = "") -> dict[str, Any]:
-    """Component template library: list/search, show pin geometry, harvest from an existing
-    .ms14 (offline), fetch a part from the Multisim database (COM + Node decoder), init from
-    official samples (COM), or build the database index."""
+    """Component template library: list/search, show pin geometry & section layouts,
+    harvest from an existing .ms14 (offline), fetch a part from the Multisim database
+    (COM), init from official samples (COM), or build the database index (ADODB or Node fallback)."""
     if action not in ("list", "show") and os.environ.get("MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES") != "1":
         return _blocked_reply("MCP part-library mutations are disabled; set MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES=1 to enable them")
     args = ["parts", action]

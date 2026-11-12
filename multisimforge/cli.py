@@ -197,7 +197,8 @@ def cmd_cursors(a):
 def cmd_capture(a):
     from . import capture
     r = capture.capture(a.ms14, a.outdir, wait=a.wait, timeout=a.timeout, keep_open=a.keep_open,
-                        on_netlist_error=a.on_netlist_error, desktop_screen=a.desktop_screen)
+                        on_netlist_error=a.on_netlist_error, desktop_screen=a.desktop_screen,
+                        cur1=a.cur1, cur2=a.cur2)
     return r, (Status.WARN if r.get("warnings") else Status.PASS)
 
 
@@ -301,6 +302,8 @@ def main(argv=None):
     s.add_argument("--desktop-screen", action="store_true", help="opt into real desktop capture requiring foreground; default is PrintWindow montage")
     s.add_argument("--on-netlist-error", choices=["abort", "continue"], default="abort",
                    help="what to do when Multisim reports a netlist error (default: abort and fail)")
+    s.add_argument("--cur1", help="optional GUI cursor 1 target position (time for XSC, frequency for XBP), e.g. 1.5ms or 1.59k")
+    s.add_argument("--cur2", help="optional GUI cursor 2 target position (time for XSC), e.g. 3.5ms")
     s.set_defaults(func=cmd_capture)
 
     s = sub.add_parser("set-sim-time", help="change the interactive simulation end time")

@@ -9,13 +9,14 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from . import xmlio
-from .config import CONFIG, ROOT, library_dir
+from .config import CONFIG, ROOT, library_dir, python32_argv
 
 STRUCT = "_struct"
 # Scope pins 1/4 are channel A +/-; 2/5 are channel B; 3/6 are external trigger; netlist order A+ B+ A- T+ B- T-
@@ -89,6 +90,249 @@ def safe_name(name: str) -> str:
 def spice_template(comp) -> str:
     t = next(comp.iter("CiaSpiceTmpltExprt"), None)
     return _s(t.get("String")) if t is not None else ""
+
+
+def _pin_table_rows(comp) -> list[tuple[str, str, str, str]]:
+    """Rows of (pin_name, pin_number, erc_type, group_tag) encoded in CiaCollString c0[39..42]."""
+    colls = _strings(comp)
+    c0 = (colls[0] if colls else []) + [""] * 43
+    names = c0[39].splitlines()
+    nums = c0[40].splitlines()
+    types = c0[41].splitlines()
+    groups = c0[42].splitlines()
+    n = min(len(names), len(nums), len(groups))
+    rows = []
+    for i in range(n):
+        pname = names[i].strip()
+        if not pname:
+            continue
+        pnum = nums[i].strip() if i < len(nums) else ""
+        ptype = types[i].strip() if i < len(types) else ""
+        grp = groups[i].strip() if i < len(groups) else ""
+        rows.append((pname, pnum, ptype, grp))
+    return rows
+
+
+def section_names(part: ET.Element) -> list[str]:
+    """Return section letters ['A', 'B', ...] for multi-section parts, or [''] for single-section parts."""
+    items = part.find("Items")
+    if items is None:
+        return [""]
+    comp = items.find("Item/CiComponent")
+    sym = items.find("Item[@Class='CIITSymbolComp']/CIITSymbolComp")
+    if comp is None or sym is None:
+        return [""]
+    num = int(sym.get("NumSections") or 1)
+    colls = _strings(comp)
+    secs = [s.strip().upper() for s in (colls[2] if len(colls) > 2 else []) if s.strip()]
+    if num <= 1 and len(secs) <= 1:
+        return [""]
+    if len(secs) >= num and secs:
+        return secs[:num] if num > 1 else secs
+    return [chr(65 + i) for i in range(num)]
+
+
+def shared_pins(part: ET.Element) -> list[str]:
+    """Visible shared package pins (COM group tags such as VS+/VS-/K/A)."""
+    items = part.find("Items")
+    if items is None:
+        return []
+    comp = items.find("Item/CiComponent")
+    if comp is None:
+        return []
+    seen, out = set(), []
+    for pname, _pnum, _ptype, grp in _pin_table_rows(comp):
+        if grp.upper() == "COM" and pname not in seen:
+            seen.add(pname)
+            out.append(pname)
+    return out
+
+
+def _template_tokens(template: str) -> list[str]:
+    return re.findall(r"%t([A-Za-z0-9_+~/\-]+)", template or "")
+
+
+def _rewrite_template_for_section(
+    template: str,
+    base_sec: str,
+    target_sec: str,
+    pin_map: dict[str, tuple[str, str]],
+) -> str:
+    """Adapt a SPICE template from *base_sec* (e.g. A) to *target_sec* (e.g. B)."""
+    if not template or base_sec.upper() == target_sec.upper():
+        return template
+    b_low = base_sec.lower()
+    t_low = target_sec.lower()
+    out = re.sub(
+        rf"(%p)_{re.escape(b_low)}\b",
+        rf"\g<1>_{t_low}",
+        template,
+        flags=re.IGNORECASE,
+    )
+    rename = {old: new for old, (new, _num) in pin_map.items() if old != new}
+    if not rename:
+        return out
+    by_len = sorted(rename, key=len, reverse=True)
+    # Match both "%t<pin>" and conditional digital pin syntax "?%t:d%t;<pin>"
+    pat = re.compile(r"(%t|\?%t:d%t;)(" + "|".join(re.escape(k) for k in by_len) + r")(?![A-Za-z0-9_+/])")
+
+    def sub(m):
+        return m.group(1) + rename[m.group(2)]
+
+    out = pat.sub(sub, out)
+    # Series dual diodes (e.g. MMBD7000LT1: sec A is %tA %tK/A, sec B is %tK/A %tK):
+    # swapping anode A->K while keeping shared K/A unchanged would invert section B unless K/A comes first.
+    if out.lstrip().lower().startswith("d%p_"):
+        toks = _template_tokens(out)
+        if len(toks) == 2 and "/" in toks[1] and toks[1] not in rename and toks[0] in rename.values():
+            orig_pin = next((o for o, n in rename.items() if n == toks[0]), "")
+            if orig_pin.upper().startswith("A") and toks[0].upper().startswith("K"):
+                out = out.replace(f"%t{toks[0]}", "\x00T0\x00", 1).replace(f"%t{toks[1]}", f"%t{toks[0]}", 1).replace("\x00T0\x00", f"%t{toks[1]}", 1)
+    return out
+
+
+def _match_section_pin(
+    old_name: str,
+    old_type: str,
+    base_num: int,
+    target_num: int,
+    candidates: list[tuple[str, str, str]],
+    used: set[str],
+) -> tuple[str, str] | None:
+    """Find the target-section pin corresponding to *old_name* in base section."""
+    avail = [(n, num, pt) for n, num, pt in candidates if n not in used]
+    if not avail:
+        return None
+    cand_map = {n: (n, num) for n, num, _pt in avail}
+    # 1. Exact digit substitution (1A->2A, ~1PR->~2PR, EN1->EN2, 1IN+->2IN+, I1->I2)
+    b_tok, t_tok = str(base_num), str(target_num)
+    if b_tok in old_name:
+        guess = old_name.replace(b_tok, t_tok)
+        if guess in cand_map:
+            return cand_map[guess]
+    # 2. Prefix/suffix addition (IN+->2IN+, A->2A)
+    for guess in (f"{t_tok}{old_name}", f"{old_name}{t_tok}"):
+        if guess in cand_map:
+            return cand_map[guess]
+    # 3. Single non-COM pin in section (e.g. MMBD7000LT1: A -> K)
+    if len(avail) == 1:
+        return avail[0][0], avail[0][1]
+    # 4. Base stem after stripping section digits
+    stem = re.sub(r"\d+", "", old_name)
+    stem_hits = [(n, num) for n, num, _pt in avail if re.sub(r"\d+", "", n) == stem]
+    if len(stem_hits) == 1:
+        return stem_hits[0]
+    # 5. Match ERC type (e.g. D:INPUT vs D:OUTPUT)
+    if old_type:
+        type_hits = [(n, num) for n, num, pt in avail if pt == old_type]
+        if len(type_hits) == 1:
+            return type_hits[0]
+    return avail[0][0], avail[0][1]
+
+
+def section_spec(part: ET.Element, section: str = "", lib: "Library | None" = None) -> dict:
+    """Resolve pin names, package pin numbers, SPICE template, and IDs for one section."""
+    items = part.find("Items")
+    comp = items.find("Item/CiComponent")
+    ports = {it.get("CiID"): _s(it[0].get("LocalName")) for it in items if it.get("Class") == "CiPort"}
+    port_nums = {
+        p[0].get("PortID"): _s(p[0].get("PinNumber"))
+        for p in items.findall("./Item[@Class='CIITSymbolComp']/CIITSymbolComp/Objects/Item[@Class='CIITPinSymbolComp']")
+    }
+    sym = items.find("Item[@Class='CIITSymbolComp']/CIITSymbolComp")
+    visible = [ports[p.get("PortID")] for p in visible_pins(sym) if p.get("PortID") in ports]
+    base_tpl = spice_template(comp)
+    secs = section_names(part)
+    if len(secs) == 1 and secs[0] == "":
+        sec = (section or "").strip().upper()
+        if sec and sec != "A":
+            raise ValueError(f"{part.get('Name')} is a single-section part and has no section {section!r}")
+        pin_map = {
+            ports[pid]: (ports[pid], port_nums.get(pid, ""))
+            for pid in ports
+        }
+        ordered = visible if part.get("Kind") == "instrument" else spice_pin_order(base_tpl, visible)
+        return {
+            "section": "",
+            "section_id": 0,
+            "pins": ordered,
+            "hidden_pins": {h.get("Name"): h.get("Net") for h in part.findall("HiddenPin")},
+            "shared_pins": [],
+            "pin_map": pin_map,
+            "template": base_tpl,
+        }
+
+    sec = (section or secs[0]).strip().upper()
+    if sec not in secs:
+        raise ValueError(f"{part.get('Name')} only has sections {secs}, got {section!r}")
+    base_sec = (_s(sym.get("IRSection")) or secs[0]).upper()
+    base_idx = secs.index(base_sec) if base_sec in secs else 0
+    target_idx = secs.index(sec)
+
+    rows = _pin_table_rows(comp)
+    com_rows = {}
+    pwr_rows = {}
+    grp_rows: dict[str, list[tuple[str, str, str]]] = {}
+    old_types: dict[str, str] = {}
+    for pname, pnum, ptype, grp in rows:
+        old_types.setdefault(pname, ptype)
+        g_up = grp.upper()
+        if g_up == "COM":
+            com_rows.setdefault(pname, (pname, pnum))
+        elif g_up.startswith("PWR:"):
+            pwr_rows.setdefault(pname, (pname, pnum))
+        elif g_up.startswith("GRP:"):
+            s_tag = grp.split(":", 1)[1].strip().upper()
+            grp_rows.setdefault(s_tag, []).append((pname, pnum, ptype))
+
+    pin_map: dict[str, tuple[str, str]] = {}
+    if sec == base_sec:
+        for pid, old_name in ports.items():
+            pin_map[old_name] = (old_name, port_nums.get(pid, ""))
+    else:
+        target_cands = grp_rows.get(sec, [])
+        used: set[str] = set()
+        for pid, old_name in ports.items():
+            orig_num = port_nums.get(pid, "")
+            if old_name in com_rows:
+                pin_map[old_name] = com_rows[old_name]
+            elif old_name in pwr_rows:
+                pin_map[old_name] = pwr_rows[old_name]
+            else:
+                matched = _match_section_pin(
+                    old_name, old_types.get(old_name, ""), base_idx + 1, target_idx + 1, target_cands, used
+                )
+                if matched is not None:
+                    used.add(matched[0])
+                    pin_map[old_name] = matched
+                else:
+                    pin_map[old_name] = (old_name, orig_num)
+
+    new_tpl = _rewrite_template_for_section(base_tpl, base_sec, sec, pin_map)
+    if lib is not None:
+        db_sec = lib.db_section(part.get("Name") or "")
+        if db_sec:
+            s1 = (db_sec.get("sections") or {}).get(base_sec, {})
+            st = (db_sec.get("sections") or {}).get(sec, {})
+            s1_pins = set(_template_tokens(s1.get("template") or ""))
+            base_tpl_pins = set(_template_tokens(base_tpl))
+            # Only adopt DB section template when section 1 DB pins match harvested template arity/pins
+            if st.get("template") and s1_pins and s1_pins == base_tpl_pins:
+                st_pins = _template_tokens(st["template"])
+                if set(st_pins) <= {v[0] for v in pin_map.values()}:
+                    new_tpl = st["template"]
+
+    new_visible = [pin_map[n][0] for n in visible if n in pin_map]
+    ordered = new_visible if part.get("Kind") == "instrument" else spice_pin_order(new_tpl, new_visible)
+    return {
+        "section": sec,
+        "section_id": target_idx,
+        "pins": ordered,
+        "hidden_pins": {h.get("Name"): h.get("Net") for h in part.findall("HiddenPin")},
+        "shared_pins": list(com_rows),
+        "pin_map": pin_map,
+        "template": new_tpl,
+    }
 
 
 def spice_pin_order(template: str, names: list[str]) -> list[str]:
@@ -211,6 +455,19 @@ class Library:
         self._lower = {k.lower(): k for k in self.index}
         self._part_cache: dict[str, ET.Element] = {}
         self._struct_cache: dict[str, ET.Element] = {}
+        self._db_sections_cache: dict | None = None
+
+    def db_section(self, name: str) -> dict | None:
+        if self._db_sections_cache is None:
+            p = self.path / "db_sections.json"
+            if p.is_file():
+                try:
+                    self._db_sections_cache = json.loads(p.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    self._db_sections_cache = {}
+            else:
+                self._db_sections_cache = {}
+        return self._db_sections_cache.get(name)
 
     def save_index(self):
         self.path.mkdir(parents=True, exist_ok=True)
@@ -276,16 +533,23 @@ def describe(part: ET.Element) -> dict:
         visible.sort(key=lambda n: order.index(n) if order and n in order else (int(n) if n.isdigit() else 999))
     colls = _strings(comp)
     prefix = re.sub(r"%d.*", "", (colls[1][4] if len(colls) > 1 and len(colls[1]) > 4 else "")) or "U"
-    return {
+    secs = section_names(part)
+    num_secs = int(sym.get("NumSections") or 1)
+    out = {
         "family": part.get("Family"),
         "kind": part.get("Kind"),
         "prefix": prefix,
         "pins": visible if part.get("Kind") == "instrument" else spice_pin_order(template, visible),
         "hidden_pins": {h.get("Name"): h.get("Net") for h in part.findall("HiddenPin")},
-        "sections": int(sym.get("NumSections") or 1),
+        "sections": num_secs,
         "template": template.strip()[:160],
         "source": f"{part.get('Source')}:{part.get('SourceRef')}",
     }
+    if len(secs) > 1 or num_secs > 1:
+        out["section_names"] = secs
+        out["shared_pins"] = shared_pins(part)
+        out["section_pins"] = {s: section_spec(part, s)["pins"] for s in secs}
+    return out
 
 
 def harvest_path(target: Path, lib: Library, force: bool = False, label_root: Path | None = None) -> dict:
@@ -360,14 +624,127 @@ def _fetch_scratch_dir(run_id: str) -> tuple[Path, bool]:
     return work, False
 
 
+def _rc4_jet(key: bytes, data: bytes) -> bytes:
+    s = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + s[i] + key[i % len(key)]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    out = bytearray(len(data))
+    i = j = 0
+    for k, b in enumerate(data):
+        i = (i + 1) & 0xFF
+        j = (j + s[i]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+        out[k] = b ^ s[(s[i] + s[j]) & 0xFF]
+    return bytes(out)
+
+
+def _jet_password(db_path: Path) -> str:
+    """Decode the Jet3/Jet4 header password from MSCOMP_S.PRD in pure Python."""
+    with db_path.open("rb") as f:
+        hdr = bytearray(f.read(256))
+    if len(hdr) < 0x98:
+        raise ValueError(f"{db_path} is too small to be a Jet database")
+    dec = _rc4_jet(bytes([0xC7, 0xDA, 0x39, 0x6B]), bytes(hdr[0x18:0x98]))
+    if hdr[0x14] == 0:
+        return dec[0x2A:0x3E].split(b"\x00", 1)[0].decode("latin-1")
+    raw_pw = bytearray(dec[0x2A:0x52])
+    cdate = dec[0x4A:0x4E]
+    for i in range(0, 40, 2):
+        raw_pw[i] ^= cdate[0] if (i // 2) % 2 == 0 else 0
+    return bytes(raw_pw).decode("utf-16-le").split("\x00", 1)[0]
+
+
+def _adodb_dbindex_script(db_path: Path, pw: str, out_index: Path, out_sections: Path) -> str:
+    return (
+        "import json, os, pythoncom, uuid, win32com.client\n"
+        "from pathlib import Path\n"
+        f"db_path = {str(db_path)!r}\n"
+        f"pw = {pw!r}\n"
+        f"out_index = Path({str(out_index)!r})\n"
+        f"out_sections = Path({str(out_sections)!r})\n"
+        "pythoncom.CoInitialize()\n"
+        "conn = win32com.client.Dispatch('ADODB.Connection')\n"
+        "conn.Open(f'Provider=Microsoft.Jet.OLEDB.4.0;Data Source={db_path};Jet OLEDB:Database Password={pw};')\n"
+        "def fetch(sql):\n"
+        "    rs = win32com.client.Dispatch('ADODB.Recordset')\n"
+        "    rs.Open(sql, conn, 0, 1)\n"
+        "    try:\n"
+        "        return () if rs.EOF else rs.GetRows()\n"
+        "    finally:\n"
+        "        rs.Close()\n"
+        "try:\n"
+        "    g_rows = fetch('SELECT Family_Group_ID, Family_Group FROM SYS_CONFIGURATION_GROUPS')\n"
+        "    groups = dict(zip(g_rows[0], g_rows[1])) if g_rows else {}\n"
+        "    f_rows = fetch('SELECT Family_ID, Family_Name, Family_Group_ID FROM SYS_CONFIGURATION')\n"
+        "    families = {fid: [groups.get(gid), fname] for fid, fname, gid in zip(*f_rows)} if f_rows else {}\n"
+        "    c_rows = fetch('SELECT Component_ID, Family_ID, Component_Name FROM SYS_COMPONENT')\n"
+        "    index, id_to_name = {}, {}\n"
+        "    if c_rows:\n"
+        "        for cid, fid, cname in zip(*c_rows):\n"
+        "            f = families.get(fid)\n"
+        "            if f and cname:\n"
+        "                name = str(cname)\n"
+        "                id_to_name[int(cid)] = name\n"
+        "                if name not in index:\n"
+        "                    index[name] = f\n"
+        "    sym_rows = fetch('SELECT Component_ID, Sec_Order, Pinout_ANSI FROM SYS_MAPPING_COMP_SYMBOL')\n"
+        "    mod_rows = fetch('SELECT Component_ID, Sec_Order, Template FROM SYS_MAPPING_COMP_MODEL')\n"
+        "    by_cid = {}\n"
+        "    if sym_rows:\n"
+        "        for cid, sec_order, pinout in zip(*sym_rows):\n"
+        "            sec_no = int(sec_order or 1)\n"
+        "            letter = chr(64 + sec_no)\n"
+        "            pins = [p.strip() for p in str(pinout or '').splitlines() if p.strip()]\n"
+        "            by_cid.setdefault(int(cid), {})[letter] = {'pins': pins}\n"
+        "    if mod_rows:\n"
+        "        for cid, sec_order, tpl in zip(*mod_rows):\n"
+        "            sec_no = int(sec_order or 1)\n"
+        "            letter = chr(64 + sec_no)\n"
+        "            entry = by_cid.setdefault(int(cid), {}).setdefault(letter, {})\n"
+        "            if tpl and 'template' not in entry:\n"
+        "                entry['template'] = str(tpl)\n"
+        "    sections_out = {}\n"
+        "    for cid, secs in by_cid.items():\n"
+        "        if len(secs) > 1 and cid in id_to_name and id_to_name[cid] not in sections_out:\n"
+        "            sections_out[id_to_name[cid]] = {'sections': secs}\n"
+        "    out_index.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    for path, data in ((out_index, index), (out_sections, sections_out)):\n"
+        "        tmp = path.with_name(f'.{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}')\n"
+        "        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')\n"
+        "        os.replace(tmp, path)\n"
+        "    print(len(index))\n"
+        "finally:\n"
+        "    conn.Close()\n"
+    )
+
+
 def build_db_index(lib: Library) -> dict:
-    """Read the master component database (Jet database) and produce {component name: [group, family]}. Requires Node.js and electronics-workbench-decoder."""
+    """Read MSCOMP_S.PRD via pure-Python Jet3/4 + ADODB on Windows (Node decoder fallback)."""
     out = lib.path / "db_index.json"
+    out_sections = lib.path / "db_sections.json"
+    db_path = Path(CONFIG["master_db"])
+    py32 = python32_argv()
+    if sys.platform == "win32" and db_path.is_file() and py32 and py32[0]:
+        try:
+            pw = _jet_password(db_path)
+            script = _adodb_dbindex_script(db_path, pw, out, out_sections)
+            r = subprocess.run([*py32, "-c", script], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=900)
+            if r.returncode == 0:
+                return {"components": int(r.stdout.strip() or 0), "index": str(out),
+                        "sections_index": str(out_sections), "backend": "adodb"}
+            adodb_err = (r.stderr or r.stdout or "").strip()[-500:]
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            adodb_err = str(exc)
+        if not (shutil.which("node") and Path(CONFIG.get("node_decoder", "")).is_dir()):
+            raise RuntimeError(f"Failed to read the master component database: {adodb_err}")
     r = subprocess.run(["node", str(ROOT / "tools" / "dbindex.js"), CONFIG["master_db"], str(out),
                         CONFIG["node_decoder"]], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=900)
     if r.returncode != 0:
         raise RuntimeError(f"Failed to read the master component database: {r.stderr.strip()[-500:]}")
-    return {"components": int(r.stdout.strip() or 0), "index": str(out)}
+    return {"components": int(r.stdout.strip() or 0), "index": str(out), "backend": "node"}
 
 
 def db_lookup(lib: Library, name: str):

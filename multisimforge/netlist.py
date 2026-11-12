@@ -81,6 +81,25 @@ def net_name(token: str) -> str:
     return "0" if t.lower() in ("0", "gnd") else t.lower()
 
 
+def split_section_ref(ref: str, valid_sections: list[str] | tuple[str, ...] | None = None) -> tuple[str, str | None]:
+    """Split a reference designator into (package_ref, section_letter_or_None).
+
+    Supports explicit dotted form ("U1.B" -> ("U1", "B")) and compact multi-section
+    suffixes ("U1B" -> ("U1", "B")) when *valid_sections* has >1 sections.
+    """
+    text = (ref or "").strip()
+    if "." in text:
+        m = re.fullmatch(r"(.+)\.([A-Za-z]+)", text)
+        if not m or len(m.group(2)) != 1:
+            raise ValueError(f"{ref}: invalid section suffix (expected e.g. U1.B)")
+        return m.group(1), m.group(2).upper()
+    if valid_sections and len([s for s in valid_sections if s]) > 1:
+        m = re.fullmatch(r"([A-Za-z]+\d+)([A-Za-z])", text)
+        if m:
+            return m.group(1), m.group(2).upper()
+    return text, None
+
+
 @dataclass
 class Instance:
     refdes: str
@@ -155,6 +174,22 @@ def _source(rest: str, refdes: str) -> dict:
     return out
 
 
+def _parse_named(ref: str, body: list[str], inst: Instance):
+    names = [t for t in body if "=" not in t]
+    if len(names) != 1:
+        raise ValueError(f"{ref}: pin-name form is {ref} model pin=net ...")
+    inst.part = names[0]
+    for t in body:
+        if "=" in t:
+            pin, _, net = t.partition("=")
+            pin = pin.strip()
+            if not pin or not net.strip():
+                raise ValueError(f"{ref}: invalid pin=net assignment {t!r}")
+            if pin in inst.named:
+                raise ValueError(f"{ref}: duplicate assignment for pin {pin!r}")
+            inst.named[pin] = net_name(net)
+
+
 _INST_REF = re.compile(r"^(?:XSC|XFG|XBP|XMM)\d*$")
 
 
@@ -217,27 +252,19 @@ def parse(text: str) -> list[Instance]:
                                      f"write {ref} node1 node2 <amps> (or use a voltage source for AC)")
                 inst.part = "DC_CURRENT"
         elif key[0] in "DQJM":
-            n = NODE_COUNT[key[0]]
-            if len(tokens) != n + 2:
-                raise ValueError(f"{ref}: write {ref} {' '.join(['node'] * n)} model")
-            inst.nets = [net_name(t) for t in tokens[1:n + 1]]
-            inst.part = tokens[n + 1]
+            body = tokens[1:]
+            if any("=" in t for t in body):
+                _parse_named(ref, body, inst)
+            else:
+                n = NODE_COUNT[key[0]]
+                if len(tokens) != n + 2:
+                    raise ValueError(f"{ref}: write {ref} {' '.join(['node'] * n)} model")
+                inst.nets = [net_name(t) for t in tokens[1:n + 1]]
+                inst.part = tokens[n + 1]
         elif key[0] in "XU" or key.startswith("LED"):
             body = tokens[1:]
             if any("=" in t for t in body):
-                names = [t for t in body if "=" not in t]
-                if len(names) != 1:
-                    raise ValueError(f"{ref}: pin-name form is {ref} model pin=net ...")
-                inst.part = names[0]
-                for t in body:
-                    if "=" in t:
-                        pin, _, net = t.partition("=")
-                        pin = pin.strip()
-                        if not pin or not net.strip():
-                            raise ValueError(f"{ref}: invalid pin=net assignment {t!r}")
-                        if pin in inst.named:
-                            raise ValueError(f"{ref}: duplicate assignment for pin {pin!r}")
-                        inst.named[pin] = net_name(net)
+                _parse_named(ref, body, inst)
             else:
                 if len(body) < 2:
                     raise ValueError(f"{ref}: write {ref} node... model")

@@ -306,7 +306,7 @@ def route_pins(start, end, obstacles, occupied=None):
     """
     a, b = (float(start["x"]), float(start["y"])), (float(end["x"]), float(end["y"]))
     first_error = None
-    for clearance in (9, 18, 27, 40):
+    for clearance in (9, 18, 27, 40, 54):
         ea, eb = pin_escape(start, obstacles, clearance), pin_escape(end, obstacles, clearance)
         bad = False
         for p, e, conn in ((a, ea, start), (b, eb, end)):
@@ -453,7 +453,7 @@ def route_island(conns, obstacles, boxes, occupied_other):
 
         best = try_attach(esc[p], 0, 4)
         if best is None:
-            for clearance in (9, 18, 27, 40):
+            for clearance in (9, 18, 27, 40, 54):
                 ep_p = esc[p] if clearance == 9 else pin_escape(conns[p], boxes, clearance)
                 for dense_flag in ((1,) if clearance == 9 else (0, 1)):
                     best = try_attach(ep_p, dense_flag, 3)
@@ -542,11 +542,11 @@ def route_all(connections, boxes, labels=()):
         return result, failures
 
     # Rip-up and retry: earlier nets occupy space, so a later one may fail only
-    # because of the order. Re-run with the failing nets first, then reversed,
-    # and keep the pass with the fewest failures.
+    # because of the order. Try up to 4 passes (shortest-first, failing-first,
+    # longest-first among remaining, and reversed) keeping the fewest failures.
     order = list(islands)
     best = None
-    for attempt in range(3):
+    for attempt in range(4):
         result, failures = one_pass(order)
         if best is None or len(failures) < len(best[1]):
             best = (result, failures)
@@ -555,7 +555,12 @@ def route_all(connections, boxes, labels=()):
         if attempt == 1 and len(failures) == 1 and order and order[0][0] == failures[0]["net"] and sum(1 for n, _ in order if n == failures[0]["net"]) == 1:
             break                              # sole failing island already failed even with zero prior wires
         failed = {f["net"] for f in failures}
-        order = [i for i in order if i[0] in failed] + [i for i in order if i[0] not in failed]
-        if attempt == 1:
-            order = list(reversed(order))
+        hot = [i for i in order if i[0] in failed]
+        rest = [i for i in order if i[0] not in failed]
+        if attempt == 0:
+            order = hot + rest
+        elif attempt == 1:
+            order = sorted(hot, key=span, reverse=True) + sorted(rest, key=span, reverse=True)
+        else:
+            order = list(reversed(islands))
     return best

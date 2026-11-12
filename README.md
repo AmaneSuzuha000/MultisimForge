@@ -36,8 +36,7 @@ MultisimForge treats a `.ms14` file as an XML container: it implements the conta
 - NI Multisim 14.x (licensed)
 - Python 3.10+
 - `pywin32`, `Pillow`, `numpy`, `scipy` for screenshots
-- a 32-bit Python with `pywin32` — Multisim's automation interface is an in-process 32-bit component
-- optional: Node.js + `electronics-workbench-decoder` (only `parts dbindex` needs it)
+- a 32-bit Python with `pywin32` — Multisim's automation interface is an in-process 32-bit component, and `parts dbindex` reads `MSCOMP_S.PRD` natively via pure-Python Jet3/4 decryption + 32-bit ADODB (Node.js + `electronics-workbench-decoder` in `tools/dbindex.js` is an optional fallback only)
 
 Local paths are detected at runtime (registry + install directories). Override them with a `config.json` in the repo root or with `MULTISIMFORGE_<KEY>` environment variables.
 
@@ -174,6 +173,8 @@ Every segment must be horizontal or vertical, and polyline endpoints must land o
 | `spice` | `--cmd "tran 1u 10m"` | SPICE command handed to Multisim's engine |
 | `capture` | `--wait <s>` | how long the display must be still to call it finished (default 1.5) |
 | | `--timeout <s>` | maximum wait (default 90) |
+| | `--cur1 <val>` | move scope T1 cursor (time) or Bode cursor (frequency) in background via Win32 messages and verify live readout |
+| | `--cur2 <val>` | move scope T2 cursor in background via Win32 messages and verify live readout |
 | | `--keep-open` | leave the window open after capture |
 | | `--desktop-screen` | opt into full-screen capture requiring foreground (default: PrintWindow montage) |
 | | `--on-netlist-error continue` | continue past the netlist-error dialog (default: abort) |
@@ -270,30 +271,31 @@ the preservation of the original circuit file's SHA-256. The manually triggered
 
 ## Known limitations
 
-- **Multisim 14.3 does not restore GUI cursor positions.** Numerical CSV cursor
-  readouts solve the measurement workflow but do not move native GUI cursors.
-- **Multi-section parts such as LM324 and 74LS00:** use
-  `multisimforge sections design.ms14 U1` (or the MCP `list_sections` tool)
-  to query which sections a native Multisim package already contains.
-  This read-only API does not construct additional sections. A harvested template places
-  only section A. Builds now report an explicit warning for parts with
-  `sections > 1`; separate instances do not share a physical IC package.
-  Full section-aware model reconstruction remains unverified and must be tested
-  on native Multisim samples before implementation.
-- **Dense routing:** multi-pass A* and layout repair are best-effort; some layouts
-  have no clean route under the supplied positions. Use explicit `wires` or
+- **Multisim 14.3 still resets saved GUI cursor positions on file reopen.** Use
+  `sim --csv` + `cursors` for pure numerical CSV readings (`not_gui_cursors: true`),
+  or pass `capture ... --cur1 <val> [--cur2 <val>]` to move live Scope T1/T2 and
+  Bode frequency cursors in the background via Win32 messages with live UI readout
+  verification (`verified_by_ui_readout: true`).
+- **Multi-section parts (`LM324AJ`, `MMBD7000LT1`, `7404N`):** supported via
+  `U1.A`/`U1.B` (or `U1B`) syntax sharing one physical package, with automatic
+  shared `COM` pin inheritance (`VS+`/`VS-`, `K/A`) and `db_sections.json` per-section
+  specialization; `multisimforge sections design.ms14 U1` (or MCP `list_sections`)
+  queries placed sections natively via `EnumSections`.
+- **Dense routing:** multi-pass A* (with up to 54-unit pin-escape escalation and 4-pass
+  rip-up-and-retry) and failing-net-prioritized layout repair are best-effort; some
+  layouts have no clean route under the supplied positions. Use explicit `wires` or
   adjust the layout. The build fails instead of silently drawing through parts.
-  Automatic layout moves are reported in `moved_parts`.
-- **Multisim ReplaceComponent can crash with 0xC0000374.** The issue is inside
-  the vendor process and cannot be conclusively eliminated by Python changes.
-  The fetch implementation retries recognized crashes once; users should save
-  independent work before fetching. Native stress testing is still required.
-- **Unmodified desktop screenshots need foreground.** Default `capture` avoids
-  this with PrintWindow raw images and an explicitly labelled composite;
-  `--desktop-screen` is the opt-in real desktop capture.
+- **Multisim `ReplaceComponent` in unsupported categories (`Basic/3D_VIRTUAL`) can crash with 0xC0000374.**
+  This fault originates inside the vendor process and cannot be fixed from Python.
+  `parts fetch` uses the single-section `2N3904` carrier, stages in ASCII paths,
+  cleans up orphaned daemon processes, and retries once safely; use `parts harvest`
+  for templates in unsupported 3D/virtual categories.
+- **Unmodified full-desktop screenshots need foreground.** Default `capture` launches
+  non-activating (`SW_SHOWNOACTIVATE`) with `PrintWindow` raw panel images and a
+  labelled composite; `--desktop-screen` is the opt-in full-desktop capture.
 - **Real-native integration and GUI lifecycle remain Windows-only.** Linux can
-  run the offline codec/netlist/checker where dependencies permit, but cannot
-  replace a licensed Windows Multisim installation.
+  run the offline codec/netlist/checker/router suites, but requires licensed
+  Windows NI Multisim 14.x for COM simulation and panel capture.
 
 ## License
 

@@ -22,6 +22,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from . import netlist as nl
+from . import parts as parts_mod
 from . import xmlio
 from .parts import Library
 from .result import new_run_id
@@ -301,8 +302,17 @@ def _refdes_str_size(raw_decoded: str) -> str:
     return str(len(raw_decoded.replace("!0", "\x00")) + 2)
 
 
-def _refdes_info(refdes, file_path, stem, template=None):
-    """RefDes record: multi-section parts copy the harvested one (it carries the pin order), everything else is created in the same format."""
+def _refdes_info(
+    refdes,
+    file_path,
+    stem,
+    template=None,
+    section: str = "",
+    section_id: int = 0,
+    pin_map: dict | None = None,
+    spice_template: str | None = None,
+):
+    """RefDes record: multi-section parts carry pin orders and section metadata; everything else is built in matching format."""
     m = re.fullmatch(r"([A-Za-z]+)(\d+)", refdes)
     if not m:
         return None
@@ -312,16 +322,49 @@ def _refdes_info(refdes, file_path, stem, template=None):
     str_size = _refdes_str_size(raw_decoded)
     if template is not None:
         item = xmlio.deepcopy(template)
-        section = xmlio.unasc(item.find("RefDesInfo").get("IRSection"))
-        item.set("CIRKey", xmlio.asc(refdes + section))
         info = item.find("RefDesInfo")
+        sec = section if section != "" else xmlio.unasc(info.get("IRSection"))
+        item.set("CIRKey", xmlio.asc(refdes + sec))
         info.set("IRPrefix", xmlio.asc(prefix))
         info.set("IRNumber", num)
+        if sec:
+            info.set("IRSection", xmlio.asc(sec))
+            info.set("IRSectionID", str(int(section_id)))
+        if spice_template is not None:
+            info.set("SpiceTemplate", xmlio.asc(spice_template))
         data = info.find("RefDesInfoData")
         data.set("RefDes", text)
         data.set("RefDesStrSize", str_size)
         data.set("Prefix", xmlio.asc(prefix))
         data.set("Number", num)
+        if sec:
+            data.set("Section", xmlio.asc(sec))
+            data.set("SectionBufSize", "260")
+            data.set("SectionStrSize", str(len(sec) + 1))
+        if pin_map and info.find("PinOrderCIR") is not None:
+            po_cir = info.find("PinOrderCIR")
+            po_ir = info.find("PinOrderIR")
+            pn_cir = info.find("PinNumbersCIR")
+            pn_ir = info.find("PinNumbersIR")
+            cir_names = [xmlio.unasc(x.get("PinNameCIR")) for x in po_cir]
+            cir_nums = [xmlio.unasc(x.get("PinNumberCIR")) for x in pn_cir] if pn_cir is not None else []
+            mapped = [
+                pin_map.get(cname, (cname, cir_nums[idx_p] if idx_p < len(cir_nums) else ""))
+                for idx_p, cname in enumerate(cir_names)
+            ]
+            xmlio.clear(po_cir)
+            for new_pname, _ in mapped:
+                ET.SubElement(po_cir, "PinOrderCIRItem", {"PinNameCIR": xmlio.asc(new_pname)})
+            if pn_cir is not None:
+                xmlio.clear(pn_cir)
+                for _, new_pnum in mapped:
+                    ET.SubElement(pn_cir, "PinNumbersCIRItem", {"PinNumberCIR": xmlio.asc(new_pnum)})
+            if po_ir is not None and pn_ir is not None:
+                xmlio.clear(po_ir)
+                xmlio.clear(pn_ir)
+                for new_pname, new_pnum in mapped:
+                    ET.SubElement(po_ir, "PinOrderIRItem", {"PinNameIR": xmlio.asc(new_pname)})
+                    ET.SubElement(pn_ir, "PinNumbersIRItem", {"PinNumberIR": xmlio.asc(new_pnum)})
         return item
     item = ET.Element("CIRToInfoMapItem", {"CIRKey": xmlio.asc(refdes)})
     info = ET.SubElement(item, "RefDesInfo", {"Class": "CIITHierRefDesInfo", "IRPrefix": xmlio.asc(prefix),
@@ -468,11 +511,20 @@ class Builder:
         nodes.append(ET.Element("Item", {"CiID": node.get("CiID")}))
         node[0].find("Ports").append(ET.Element("Item", {"CiID": port_item.get("CiID")}))
 
+    @staticmethod
+    def _set_coll_string(comp, coll_idx: int, item_idx: int, value: str) -> None:
+        colls = list(comp.iter("CiaCollString"))
+        if coll_idx < len(colls):
+            strings = colls[coll_idx].find("strings")
+            if strings is not None and item_idx < len(strings):
+                strings[item_idx].set("Value", xmlio.asc(value))
+
     # -- parts --------------------------------------------------------------
-    def place(self, refdes, part_name, nets: dict, center, angle=0, inst=None, ground=False, mirror=None):
+    def place(self, refdes, part_name, nets: dict, center, angle=0, inst=None, ground=False, mirror=None,
+              section: str = "", sec_spec: dict | None = None):
         """nets: {port name: net}; center: target pin centre coordinate."""
         part = self.lib.load(part_name)
-        pin_order = self.lib.index[self.lib.resolve(part_name)]["pins"]
+        info_rec = self.lib.index[self.lib.resolve(part_name)]
         items = list(part.find("Items"))
         xmlio.remap(items, self.ids)
         comp_item = next(i for i in items if i.get("Class") == "CiComponent")
@@ -480,7 +532,8 @@ class Builder:
         models = [i for i in items if i.get("Class") == "CiModel"]
         sym_item = next(i for i in items if i.get("Class") == "CIITSymbolComp")
         comp, sym = comp_item[0], sym_item[0]
-        comp.set("LocalName", xmlio.asc("0" if ground else refdes))
+        pkg_ref = "0" if ground else refdes
+        comp.set("LocalName", xmlio.asc(pkg_ref))
         sym.set("CiComponent", comp_item.get("CiID"))
         if comp.get("SymCompID") not in (None, "", "0"):
             comp.set("SymCompID", sym_item.get("ID"))
@@ -495,18 +548,84 @@ class Builder:
                 m.set("LocalName", xmlio.asc(new))
                 card = m.find("Attributes/Item/CiaCString")
                 if card is not None:
-                    card.set("String", re.sub(r"(?i)^(&ASC\s*\.(?:SUBCKT|MODEL)\s+)\S+", lambda mm, n=new: mm.group(1) + n,
-                                              card.get("String", ""), count=1))
+                    raw_card = xmlio.unasc(card.get("String", ""))
+                    updated_card = re.sub(
+                        r"(?im)^(\s*\.(?:SUBCKT|MODEL)\s+)\S+",
+                        lambda mm, n=new: mm.group(1) + n,
+                        raw_card,
+                        count=1,
+                    )
+                    card.set("String", xmlio.asc(updated_card))
+
+        if not ground and (sec_spec is not None or section or int(sym.get("NumSections") or 1) > 1):
+            sec_spec = sec_spec or parts_mod.section_spec(part, section or "A", self.lib)
+        actual_sec = sec_spec["section"] if sec_spec else (section or xmlio.unasc(sym.get("IRSection") or ""))
+        actual_sec_id = sec_spec["section_id"] if sec_spec else int(sym.get("IRSectionID") or 0)
+        pin_map = sec_spec["pin_map"] if sec_spec else {}
+        new_tpl = sec_spec["template"] if sec_spec else None
+        display_ref = refdes if ground else (pkg_ref + actual_sec)
+        pin_order = (sec_spec["pins"] if sec_spec else None) or info_rec["pins"]
+
+        if actual_sec and not ground:
+            self._set_coll_string(comp, 0, 6, actual_sec)
+            if new_tpl is not None:
+                tpl_el = next(comp.iter("CiaSpiceTmpltExprt"), None)
+                if tpl_el is not None:
+                    tpl_el.set("String", xmlio.asc(new_tpl))
+                self._set_coll_string(comp, 1, 5, new_tpl)
+            sym.set("IRSection", xmlio.asc(actual_sec))
+            sym.set("IRSectionID", str(int(actual_sec_id)))
+            if "DBComponentSectionName" in sym.attrib or actual_sec:
+                sym.set("DBComponentSectionName", xmlio.asc(actual_sec))
+
+        # Rename ports and visible symbol pin graphics to match the target section
+        pin_sym_by_pid = {
+            p[0].get("PortID"): p[0]
+            for p in sym.findall("./Objects/Item[@Class='CIITPinSymbolComp']")
+        }
+        name_of = {}
+        for port in ports:
+            pid = port.get("CiID")
+            old_pname = xmlio.unasc(port[0].get("LocalName"))
+            new_pname, new_pnum = pin_map.get(old_pname, (old_pname, ""))
+            if pin_map and new_pname != old_pname:
+                port[0].set("LocalName", xmlio.asc(new_pname))
+            psym = pin_sym_by_pid.get(pid)
+            if psym is not None and pin_map:
+                if "PinName" in psym.attrib:
+                    psym.set("PinName", xmlio.asc(new_pname))
+                if new_pnum:
+                    psym.set("PinNumber", xmlio.asc(new_pnum))
+                pname_txt = psym.find("./Objects/Item/CIITPinSymTextCompName")
+                if pname_txt is not None:
+                    pname_txt.set("Output", xmlio.asc(new_pname))
+                pnum_txt = psym.find("./Objects/Item/CIITPinSymTextCompNumber")
+                if pnum_txt is not None and new_pnum:
+                    pnum_txt.set("Output", xmlio.asc(new_pnum))
+            name_of[pid] = new_pname
 
         kind = refdes[0].upper()
         value_label = apply_value(inst, comp, kind) if inst is not None else None
         name_label = sym.find("./Objects/Item/CIITSymTextCompName")
         if name_label is not None:
-            section = xmlio.unasc(sym.get("IRSection"))
-            name_label.set("Output", "" if ground else xmlio.asc(refdes + section))
+            name_label.set("Output", "" if ground else xmlio.asc(display_ref))
         value_item = sym.find("./Objects/Item/CIITSymTextCompValue")
-        if value_label and value_item is not None:
-            value_item.set("Output", value_label)
+        if value_item is not None:
+            if value_label:
+                value_item.set("Output", value_label)
+            else:
+                cur_val = xmlio.text(value_item.get("Output") or "")
+                src_ref = part.get("SourceRef") or ""
+                if "\n" in cur_val:
+                    raw_lines = [ln.strip() for ln in cur_val.splitlines() if ln.strip()]
+                    if raw_lines and raw_lines[0].lower() == part.get("Name", "").lower():
+                        lines = [
+                            ln for i, ln in enumerate(raw_lines)
+                            if i == 0 or (ln != src_ref and not re.fullmatch(r"[A-Za-z]{1,4}\d+[A-Za-z]?", ln))
+                        ]
+                        cleaned_val = "\n".join(lines) if lines else part_name
+                        if cleaned_val != cur_val:
+                            value_item.set("Output", xmlio.asc(cleaned_val))
 
         for tag in ("CIITSymTextCompName", "CIITSymTextCompValue"):
             label = sym.find("./Objects/Item/" + tag)
@@ -528,7 +647,6 @@ class Builder:
         sym.set("Transformer-M20", f"{tx:g}")
         sym.set("Transformer-M21", f"{ty:g}")
 
-        name_of = {p.get("CiID"): xmlio.unasc(p[0].get("LocalName")) for p in ports}
         hidden = {h.get("Name"): h.get("Net").lower() for h in part.findall("HiddenPin") if h.get("Net")}
         pts = []
         for port in ports:
@@ -536,23 +654,24 @@ class Builder:
             net = nets.get(pname, hidden.get(pname))
             self._attach(port, net)
             if net is not None and not ground:
-                self.expected.setdefault(net, set()).add(f"{refdes}.{pname}")
+                self.expected.setdefault(net, set()).add(f"{display_ref}.{pname}")
             pin = pins.get(port.get("CiID"))
             if pin is None or net is None:
                 continue
             conn = {"x": tx + pin["x"], "y": ty + pin["y"], "connector": pin["connector"], "symbol": sym_item,
-                    "refdes": refdes, "direction": pin["direction"], "ground": ground}
+                    "refdes": display_ref, "direction": pin["direction"], "ground": ground}
             self.connections.setdefault(net, []).append(conn)
             pts.append((conn["x"], conn["y"]))
         if not pts:
             pts = [(tx + p["x"], ty + p["y"]) for p in pins.values()] or [(tx, ty)]
         # Routing obstacle box = pin bounds grown by two cells: keeps wires clear of the part body, and both the boundary and the escape points land on the 9-unit grid
         x0, y0 = min(p[0] for p in pts), min(p[1] for p in pts)
-        box = {"refdes": refdes, "x": x0 - 18, "y": y0 - 18,
+        box = {"refdes": display_ref, "x": x0 - 18, "y": y0 - 18,
                "width": max(p[0] for p in pts) - x0 + 36, "height": max(p[1] for p in pts) - y0 + 36}
         self.boxes.append(box)
-        self.labels.extend(_label_boxes(sym_item, refdes))
-        self.placements.append({"refdes": refdes, "part": part_name, "center": [center[0], center[1]], "angle": angle, "mirror": mirror,
+        self.labels.extend(_label_boxes(sym_item, display_ref))
+        self.placements.append({"refdes": display_ref, "part": part_name, "package": pkg_ref, "section": actual_sec or None,
+                                "center": [center[0], center[1]], "angle": angle, "mirror": mirror,
                                 "box": [box["x"], box["y"], box["width"], box["height"]]})
 
         self.objects.append(sym_item)
@@ -563,10 +682,13 @@ class Builder:
         state = part.find("Instrument/CSourceSymbolCollectNode")
         if state is not None:
             state = xmlio.deepcopy(state)
-            state.set("CompLongName", f"&ASC{refdes}#1/{self.stem}:")
-            self.instrument_states.append((refdes, state))
+            state.set("CompLongName", f"&ASC{pkg_ref}#1/{self.stem}:")
+            self.instrument_states.append((pkg_ref, state))
         if not ground:
-            info = _refdes_info(refdes, str(self.out), self.stem, part.find("RefDesInfo/CIRToInfoMapItem"))
+            info = _refdes_info(
+                pkg_ref, str(self.out), self.stem, part.find("RefDesInfo/CIRToInfoMapItem"),
+                section=actual_sec, section_id=actual_sec_id, pin_map=pin_map, spice_template=new_tpl,
+            )
             if info is not None:
                 self.refdes_items.append(info)
         return pins
@@ -920,11 +1042,14 @@ REPAIR_BUDGET_PER_CANDIDATE = 0.5      # seconds; generous ceiling even on slow 
 _INSTRUMENT_REF = re.compile(r"^(?:XSC|XFG|XBP|XMM)\d*$", re.I)
 
 
-def _layout_key(layout: dict, refdes: str):
-    stripped = refdes[1:] if len(refdes) > 1 and refdes[0] in "Xx" else refdes
-    for key in (refdes, refdes.upper(), "X" + refdes, stripped):
-        if key in layout:
-            return layout[key]
+def _layout_key(layout: dict, *names: str):
+    for raw in names:
+        if not raw:
+            continue
+        stripped = raw[1:] if len(raw) > 1 and raw[0] in "Xx" else raw
+        for key in (raw, raw.upper(), "X" + raw, stripped):
+            if key in layout:
+                return layout[key]
     return None
 
 
@@ -952,15 +1077,16 @@ def build(spec: dict, lib: Library | None = None, allow_fallback: bool = False,
     lib = lib or Library()
     try:
         return _build_once(spec, lib, allow_fallback)
-    except RouteError:
+    except RouteError as err:
         if allow_fallback or not auto_repair:
             raise
+        failing_nets = {f["net"] for f in err.failures if f.get("net")}
         out = Path(spec["output"]).resolve()
         best = None                                # (score, root, result)
         if repair_budget_s is None:
             repair_budget_s = REPAIR_BUDGET_PER_CANDIDATE * max_repairs
         deadline = time.monotonic() + repair_budget_s
-        for candidate, moves in _repair_variants(spec, max_repairs):
+        for candidate, moves in _repair_variants(spec, max_repairs, failing_nets=failing_nets):
             if time.monotonic() > deadline:
                 break                              # keep a failing build fast; report the best attempt so far
             try:
@@ -1004,23 +1130,38 @@ def _repair_score(result: dict, root=None) -> int:
     return len(report["problems"]) * 1000 + len(report["warnings"]) * 10 + len(result["warnings"]) - 1
 
 
-def _repair_variants(spec: dict, limit: int):
+def _repair_variants(spec: dict, limit: int, failing_nets: set[str] | None = None):
     """Yield (spec_with_moved_parts, {label: (dx, dy)}) for small grid-aligned layout nudges.
 
-    Ground symbols come first (small, and the usual blocker when a part is placed
-    over one), then the parts; instruments never move. Offsets escalate from one
-    grid step (9 units) to four (36 units), in both axes.
+    Ground symbols and parts belonging to failing nets come first (when known), while
+    iterating breadth-first over all movable objects before deepening the nudge distance.
     """
     layout = spec.get("layout") or {}
-    targets = [("GND", index) for index in range(len(layout.get("GND") or []))]
-    targets += [("part", name) for name, pos in layout.items()
-                if isinstance(pos, list) and len(pos) >= 2 and isinstance(pos[0], (int, float))
-                and str(name).upper() != "GND" and _INSTRUMENT_REF.match(str(name)) is None]
+    gnd_targets = [("GND", index) for index in range(len(layout.get("GND") or []))]
+    part_targets = [("part", name) for name, pos in layout.items()
+                    if isinstance(pos, list) and len(pos) >= 2 and isinstance(pos[0], (int, float))
+                    and str(name).upper() != "GND" and _INSTRUMENT_REF.match(str(name)) is None]
+    if failing_nets and spec.get("netlist"):
+        try:
+            hot_refs = set()
+            for inst in nl.parse(spec["netlist"]):
+                nets = set(inst.nets) | set(inst.named.values())
+                if nets & failing_nets:
+                    ref_u = inst.refdes.upper()
+                    hot_refs.update((ref_u, ref_u.replace(".", ""), ref_u.lstrip("X")))
+            part_targets.sort(key=lambda t: 0 if (t[1].upper() in hot_refs or t[1].upper().replace(".", "") in hot_refs) else 1)
+        except Exception:
+            pass
+    targets = (gnd_targets if not (failing_nets and "0" not in failing_nets) else []) + part_targets
+    if failing_nets and "0" not in failing_nets:
+        targets += gnd_targets
     offsets = [
         (0, 9), (0, -9), (9, 0), (-9, 0),
         (0, 27), (0, -27), (27, 0), (-27, 0),
         (0, 36), (0, -36), (36, 0), (-36, 0),
         (0, 18), (0, -18), (18, 0), (-18, 0),
+        (18, 18), (-18, 18), (18, -18), (-18, -18),
+        (0, 54), (0, -54), (54, 0), (-54, 0),
     ]
     boxes = []
     for name, pos in layout.items():
@@ -1090,36 +1231,99 @@ def _assemble(spec: dict, lib: Library, allow_fallback: bool, out=None) -> tuple
     b = Builder(lib, out)
     params_of = {}
     placed_refs = set()
-    auto = 0
+    pkg_parts = {}
+    pkg_counts = {}
+    prepared = []
     for inst in instances:
         key = lib.resolve(inst.part)
         if key is None:
             raise KeyError(f"{inst.refdes}: part {inst.part!r} is not in the part library (search with 'multisimforge parts list', "
                            f"fetch it from the Multisim database with 'multisimforge parts fetch {inst.part}')")
         info = lib.index[key]
-        if int(info.get("sections") or 1) > 1:
-            b.warnings.append(
-                f"{inst.refdes} ({key}) has {info['sections']} physical sections; "
-                "this template places section A only. Separate instances are NOT "
-                "automatically linked to the same IC package."
-            )
-        refdes = inst.refdes
-        if refdes[0] in "Xx" and info["kind"] != "instrument" and len(refdes) > 1 and refdes[1].isalpha():
-            refdes = refdes[1:]                      # XU1 -> U1 (Multisim naming convention)
-        if refdes.upper() in placed_refs:
-            raise ValueError(f"duplicate refdes after naming normalization: {refdes} (from {inst.refdes})")
-        placed_refs.add(refdes.upper())
-        pins = info["pins"]
+        part = lib.load(key)
+        valid_secs = parts_mod.section_names(part)
+        norm_ref = inst.refdes
+        if norm_ref[0] in "Xx" and info["kind"] != "instrument" and len(norm_ref) > 1 and norm_ref[1].isalpha():
+            norm_ref = norm_ref[1:]                 # XU1 / XU1.B / XU1B -> U1 / U1.B / U1B
+        pkg_ref, req_sec = nl.split_section_ref(norm_ref, valid_secs)
+        is_multi = len(valid_secs) > 1
+        if is_multi:
+            sec_letter = (req_sec or valid_secs[0]).upper()
+            if sec_letter not in valid_secs:
+                raise ValueError(f"{inst.refdes}: {key} only supports sections {valid_secs}, got {sec_letter!r}")
+        else:
+            if req_sec is not None:
+                raise ValueError(f"{inst.refdes}: single-section part {key} does not support section '.{req_sec}'")
+            sec_letter = ""
+        pkg_upper = pkg_ref.upper()
+        if pkg_upper in pkg_parts and pkg_parts[pkg_upper] != key:
+            raise ValueError(f"package {pkg_ref} cannot mix different parts {pkg_parts[pkg_upper]!r} and {key!r}")
+        pkg_parts[pkg_upper] = key
+        slot_key = (pkg_upper, sec_letter)
+        if slot_key in placed_refs:
+            raise ValueError(f"duplicate refdes after naming normalization: {pkg_ref}{sec_letter} (from {inst.refdes})")
+        placed_refs.add(slot_key)
+        pkg_counts[pkg_upper] = pkg_counts.get(pkg_upper, 0) + 1
+
+        sec_spec = parts_mod.section_spec(part, sec_letter, lib) if is_multi else None
+        pins = sec_spec["pins"] if sec_spec else info["pins"]
+        hidden_pins = info["hidden_pins"]
+        pin_map = sec_spec["pin_map"] if sec_spec else {}
         if inst.named:
-            bad = [p for p in inst.named if p not in pins and p not in info["hidden_pins"]]
+            nets = {}
+            bad = []
+            for p, net in inst.named.items():
+                if p in pins or p in hidden_pins:
+                    nets[p] = net
+                elif p in pin_map and pin_map[p][0] in pins and p[:1].isdigit():
+                    # Safe numbered alias when targeting a non-A op-amp/gate (e.g. 1IN+ -> 2IN+ on sec B)
+                    nets[pin_map[p][0]] = net
+                elif re.match(r"^[A-Za-z~]+1$", p) and p in pin_map and pin_map[p][0] in pins:
+                    nets[pin_map[p][0]] = net
+                else:
+                    bad.append(p)
             if bad:
-                raise ValueError(f"{inst.refdes}: {key} has no pin {bad}; available pins {pins + list(info['hidden_pins'])}")
-            nets = dict(inst.named)
+                raise ValueError(f"{inst.refdes}: {key} section {sec_letter or 'A'} has no pin {bad}; "
+                                 f"available pins {pins + list(hidden_pins)}")
         else:
             if len(inst.nets) > len(pins):
                 raise ValueError(f"{inst.refdes}: {key} only has {len(pins)} pins {pins}, the netlist gave {len(inst.nets)} nodes")
             nets = dict(zip(pins, inst.nets))
-        pos = _layout_key(layout, inst.refdes) or _layout_key(layout, refdes)
+        prepared.append((inst, key, info, pkg_ref, sec_letter, sec_spec, nets))
+
+    # Enforce consistency and auto-inherit shared/hidden pins (e.g. VS+, VS-, K/A) across sections of one package
+    shared_nets: dict[str, dict[str, str]] = {}
+    for _inst, _key, info, pkg_ref, sec_letter, sec_spec, nets in prepared:
+        if not sec_spec:
+            continue
+        pkg_upper = pkg_ref.upper()
+        shared = set(sec_spec.get("shared_pins") or []) | set(info.get("hidden_pins") or {})
+        pkg_map = shared_nets.setdefault(pkg_upper, {})
+        for sp in shared:
+            if sp in nets:
+                if sp in pkg_map and pkg_map[sp] != nets[sp]:
+                    raise ValueError(
+                        f"package {pkg_ref} shared pin {sp} has conflicting nets {pkg_map[sp]!r} vs {nets[sp]!r}"
+                    )
+                pkg_map[sp] = nets[sp]
+    for _inst, _key, info, pkg_ref, sec_letter, sec_spec, nets in prepared:
+        if not sec_spec:
+            continue
+        pkg_map = shared_nets.get(pkg_ref.upper(), {})
+        for sp in sec_spec.get("shared_pins") or []:
+            if sp not in nets and sp in pkg_map:
+                nets[sp] = pkg_map[sp]
+        for hp in info.get("hidden_pins") or {}:
+            if hp not in nets and hp in pkg_map:
+                nets[hp] = pkg_map[hp]
+
+    auto = 0
+    for inst, key, _info, pkg_ref, sec_letter, sec_spec, nets in prepared:
+        pkg_upper = pkg_ref.upper()
+        candidates = [inst.refdes, f"{pkg_ref}{sec_letter}", f"{pkg_ref}.{sec_letter}"]
+        if pkg_counts[pkg_upper] == 1 and sec_letter:
+            candidates.append(pkg_ref)
+        pos = _layout_key(layout, *candidates)
         if pos is None:                              # parts without coordinates are spread out on the grid
             pos = [150 + (auto % 5) * 180, 150 + (auto // 5) * 180]
             auto += 1
@@ -1133,8 +1337,9 @@ def _assemble(spec: dict, lib: Library, allow_fallback: bool, out=None) -> tuple
                 mirror = third
         if len(pos) > 3 and pos[3] is not None:
             mirror = pos[3]
-        b.place(refdes, key, nets, (float(pos[0]), float(pos[1])), angle, inst=inst, mirror=mirror)
-        params_of[refdes] = inst.params
+        b.place(pkg_ref, key, nets, (float(pos[0]), float(pos[1])), angle, inst=inst, mirror=mirror,
+                section=sec_letter, sec_spec=sec_spec)
+        params_of[pkg_ref] = inst.params
     grounded = any("0" in (list(i.named.values()) + i.nets) for i in instances)
     grounds = layout.get("GND") or []
     if grounded and not grounds:

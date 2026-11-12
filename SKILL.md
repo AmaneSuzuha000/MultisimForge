@@ -36,7 +36,7 @@ python -m multisimforge <command> ...
 | `sim x.ms14 --nets a,b --op / --ac 10,100k[,points] --out b --in a --at 1k / --tran 10m[,rate] [--csv dir]` | simulation data from Multisim |
 | `cursors file.csv --column col --x1 a --x2 b` | interpolate numerical cursors from simulator CSV (never modifies GUI cursors) |
 | `spice x.cir --cmd "tran 1u 10m"` | hand arbitrary SPICE text to Multisim's command-line engine |
-| `capture x.ms14 outdir [--desktop-screen]` | real screenshots: `<stem>_circuit.png`, `<stem>_XSC1.png` panels, `<stem>_montage.png` (and `<stem>_screen.png` with `--desktop-screen`) |
+| `capture x.ms14 outdir [--cur1 v --cur2 v] [--desktop-screen]` | real screenshots: `<stem>_circuit.png`, `<stem>_XSC1.png` panels, `<stem>_montage.png` (and optional background `--cur1`/`--cur2` cursor placement) |
 | `set-sim-time x.ms14 20ms` | change the interactive simulation stop time |
 | `com status / stop` | inspect or release the background COM worker |
 | `decode / encode` | .ms14 ↔ XML (debugging) |
@@ -52,9 +52,9 @@ python -m multisimforge <command> ...
 
 ## Known limitations
 
-- Scope and bode cursors cannot be preset, so they sit at the start of the trace in screenshots; put the actual frequency and voltage readings from `sim` in the text or the caption.
-- Multi-section parts (LM324, 74LS00, ...) use section A per instance; digital parts keep VCC/GND on hidden pins, connected by default to VCC/GND nets (Multisim's ideal digital supply), so no extra wiring is needed.
-- Routing is automatic A*, so dense circuits can still detour - move coordinates to fix it. To pin the routing of a net, use `wires` in the spec (endpoints must land on a pin or a wire intersection).
-- `parts fetch` needs Node.js and `electronics-workbench-decoder` (to read the database index, about 10 s the first time). If the COM replace occasionally fails, ask the user to place that part in Multisim, save, and run `parts harvest`.
+- Multisim 14.3 still resets saved cursor positions on file reopen; pass `capture ... --cur1 <t1|freq> [--cur2 <t2>]` to position live GUI cursors in background and read their UI-verified readouts, or use `sim --csv` + `cursors` for CSV interpolation.
+- Multi-section parts (`U1.A`/`U1.B` for LM324, 7404N, MMBD7000LT1) share one physical package and auto-inherit shared `COM` pins; digital parts still keep VCC/GND on hidden pins unless wired explicitly.
+- Routing is automatic A*, so dense circuits can still detour - move coordinates or pass explicit `wires` (endpoints must land on a pin or a wire intersection).
+- `parts fetch` reads the master DB directly via pure-Python Jet3/4 decryption + 32-bit ADODB (no Node.js required; Node decoder kept as fallback). Unsupported 3D/virtual categories (`Basic/3D_VIRTUAL`) still fault inside NI's COM process; use `parts harvest` if a category fails.
 
 Part library mechanics and local paths are in `docs/parts.md`.
