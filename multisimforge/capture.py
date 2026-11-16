@@ -429,8 +429,8 @@ def _move_xsc_cursor(ph: int, canvas: int, readout_hwnd: int, btn_l: int, btn_r:
         cur_hx = h1 if color == "cyan" else h2
         cur_t = ro.get(key)
         if cur_hx is None:
-            cur_hx = x_lo if cur_t is None else max(x_lo, min(x_hi, round(x_lo + (cur_t - t_lo) / span_t * (x_hi - x_lo))))
-        if cur_t is not None and abs(target - cur_t) <= abs(span_t) * 0.004:
+            cur_hx = x_lo if (cur_t is None or span_t == 0) else max(x_lo, min(x_hi, round(x_lo + (cur_t - t_lo) / span_t * (x_hi - x_lo))))
+        if cur_t is not None and span_t and abs(target - cur_t) <= abs(span_t) * 0.004:
             break
         frac = (target - t_lo) / span_t if span_t else 0.5
         est_x = max(x_lo, min(x_hi, round(x_lo + frac * (x_hi - x_lo))))
@@ -474,6 +474,11 @@ def _move_xsc_cursor(ph: int, canvas: int, readout_hwnd: int, btn_l: int, btn_r:
 def position_scope_cursors(ph: int, cur1: float | None, cur2: float | None) -> dict:
     """Move T1/T2 oscilloscope cursors via background Win32 messages and verify static readouts."""
     by_id = _children_by_id(ph)
+    required = (1050, 10015, 10011, 10012, 10013, 10014)
+    if any(not by_id.get(cid) for cid in required):
+        return {"method": "win32_background_messages", "verified_by_ui_readout": False,
+                "requested": {"t1": cur1, "t2": cur2},
+                "warnings": ["Oscilloscope panel controls not found for background cursor positioning"]}
     canvas = by_id[1050][0]
     readout_hwnd = by_id[10015][0]
     b1_l, b1_r = by_id[10011][0], by_id[10012][0]
@@ -489,13 +494,14 @@ def position_scope_cursors(ph: int, cur1: float | None, cur2: float | None) -> d
     _drag_canvas(canvas, probe_sx, probe_ex)
     ro_probe = parse_scope_readout(win32gui.GetWindowText(readout_hwnd))
     # Determine which cursor moved during probe drag (top stacked handle could be t1 or t2)
+    moved_key = None
     if ro_probe.get("t2") is not None and ro0.get("t2") != ro_probe.get("t2"):
-        moved_t = ro_probe["t2"]
+        moved_t, moved_key = ro_probe["t2"], "t2"
     elif ro_probe.get("t1") is not None and ro0.get("t1") != ro_probe.get("t1"):
-        moved_t = ro_probe["t1"]
+        moved_t, moved_key = ro_probe["t1"], "t1"
     else:
         moved_t = None
-    if moved_t is not None and probe_ex > probe_sx:
+    if moved_t is not None and moved_t != t_lo and probe_ex > probe_sx:
         dt_per_px = (moved_t - t_lo) / (probe_ex - probe_sx)
         t_lo_cal = t_lo - (probe_sx - x_lo) * dt_per_px
         t_hi_cal = t_lo_cal + (x_hi - x_lo) * dt_per_px
@@ -511,6 +517,8 @@ def position_scope_cursors(ph: int, cur1: float | None, cur2: float | None) -> d
         _, w2 = _move_xsc_cursor(ph, canvas, readout_hwnd, b2_l, b2_r, "t2", cur2, "yellow",
                                  ox, oy, w, x_lo, x_hi, t_lo_cal, t_hi_cal)
         warns.extend(w2)
+    elif moved_key == "t2" and probe_ex != probe_sx:
+        _drag_canvas(canvas, probe_ex, probe_sx)
     final_ro = parse_scope_readout(win32gui.GetWindowText(readout_hwnd))
     return {"method": "win32_background_messages", "verified_by_ui_readout": True,
             "requested": {"t1": cur1, "t2": cur2}, **final_ro, "warnings": warns}
@@ -519,6 +527,11 @@ def position_scope_cursors(ph: int, cur1: float | None, cur2: float | None) -> d
 def position_bode_cursor(ph: int, target_freq: float) -> dict:
     """Move Bode plotter cursor via background Win32 messages and verify live frequency/gain readouts."""
     by_id = _children_by_id(ph)
+    required = (1050, 10024, 10025, 10022, 10023)
+    if any(not by_id.get(cid) for cid in required):
+        return {"method": "win32_background_messages", "verified_by_ui_readout": False,
+                "requested": {"freq": target_freq},
+                "warnings": ["Bode plotter controls not found for background cursor positioning"]}
     canvas = by_id[1050][0]
     f_hwnd, y_hwnd = by_id[10024][0], by_id[10025][0]
     b_l, b_r = by_id[10022][0], by_id[10023][0]
@@ -848,6 +861,8 @@ def sweep_info(ms14: Path):
 def _close(pid: int, main=None) -> None:
     """Close Multisim politely first; force-kill only what refuses to go away."""
     try:
+        if main is None and win32gui is not None:
+            main = next((h for h, _, c, _ in top_windows(pid) if c.startswith("Multisim")), None)
         if main:
             win32api.PostMessage(main, win32con.WM_CLOSE, 0, 0)
     except Exception:

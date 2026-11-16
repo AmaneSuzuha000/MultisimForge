@@ -299,3 +299,147 @@ def test_com_cleanup_orphans_only_kills_dead_daemon_multisim_pids(monkeypatch):
     com._cleanup_orphans({"pid": 555, "multisim_pids": ["101", "202", "303"]})
     targeted = {cmd[2] for cmd in killed if cmd[0] == "taskkill"}
     assert targeted == {"101", "202"}
+
+
+def test_parse_value_accepts_greek_small_mu():
+    assert netlist.parse_value("4.7μ") == pytest.approx(4.7e-6)
+    assert netlist.parse_value("10μs") == pytest.approx(10e-6)
+
+
+def test_match_section_pin_handles_letter_suffixed_multisection_pins(tmp_path):
+    # Regression guard for dual op-amps like LTC6244 (+INA/-INA/OUTA -> +INB/-INB/OUTB)
+    # where ERC-type fallback alone could swap non-inverting and inverting inputs.
+    cands = [("+INB", "5", "A:INPUT"), ("-INB", "6", "A:INPUT"), ("OUTB", "7", "A:OUTPUT")]
+    used = set()
+    m1 = parts._match_section_pin("-INA", "A:INPUT", 1, 2, cands, used, base_sec="A", target_sec="B")
+    used.add(m1[0])
+    m2 = parts._match_section_pin("+INA", "A:INPUT", 1, 2, cands, used, base_sec="A", target_sec="B")
+    assert m1[0] == "-INB" and m2[0] == "+INB"
+
+    # Token boundary must not truncate pin names containing '~' or '-'
+    tpl = "a%p_a %t~1Q %t~1 %m"
+    out = parts._rewrite_template_for_section(tpl, "A", "B", {"~1": ("~2", "1"), "~1Q": ("~2Q", "2")})
+    assert out == "a%p_b %t~2Q %t~2 %m"
+
+    # Case-insensitive Library.db_section lookup
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+    (lib_dir / "db_sections.json").write_text(json.dumps({"LM324AJ": {"sections": {"A": {"pins": ["1IN+"]}}}}), encoding="utf-8")
+    lib = parts.Library(lib_dir)
+    assert lib.db_section("lm324aj") is not None
+
+
+def test_check_comp_label_and_builder_repair_hot_ref_normalization():
+    xml = xmlio.parse_text(
+        '<?xml version="1.0"?><Root><CIITDiagram><Elements>'
+        '<Item CiID="1" Class="CiComponent"><CiComponent LocalName="&amp;ASCQA"/></Item>'
+        '<Item CiID="2" Class="CiComponent"><CiComponent LocalName="&amp;ASCQA"/></Item>'
+        '<Item ID="3" Class="CIITSymbolComp"><CIITSymbolComp CiComponent="1" IRSection="&amp;ASCA" NumSections="2"><Objects/></CIITSymbolComp></Item>'
+        '<Item ID="4" Class="CIITSymbolComp"><CIITSymbolComp CiComponent="2" IRSection="&amp;ASCB" NumSections="2"><Objects/></CIITSymbolComp></Item>'
+        '</Elements></CIITDiagram></Root>'
+    )
+    c = check.Circuit(xml)
+    assert c.comp_label("1") == "QAA" and c.comp_label("2") == "QAB"
+
+    variants = list(builder._repair_variants({
+        "netlist": "XU1.B LM324AJ 2IN+=hot 2IN-=0 VS+=vcc VS-=0 2OUT=out\nR1 other 0 1k\n",
+        "output": "x.ms14",
+        "layout": {"R1": [100, 100], "U1B": [300, 300], "GND": [[100, 200]]},
+    }, 10, failing_nets={"hot"}))
+    # Part on failing net ("U1B") must be moved before unrelated part ("R1")
+    assert next(iter(variants[0][1])) == "U1B"
+
+
+def test_add_probes_reads_existing_cir_outprobe_slots_without_collision(tmp_path):
+    root = xmlio.parse_text(
+        '<?xml version="1.0"?><Root><CIITDiagram>'
+        '<Components><CODComposite><Objects/></CODComposite></Components>'
+        '<Elements>'
+        '<Item CiID="1" Class="CiCircuit"><CiCircuit><Nodes/><Components/><ProbeExts/></CiCircuit></Item>'
+        '<Item CiID="2" Class="CiNode"><CiNode LocalName="&amp;ASCvin"/></Item>'
+        '<Item CiID="3" Class="CIITLinkComp"><CIITLinkComp Node="2"><Points><Item X="0" Y="0"/><Item X="100" Y="0"/></Points></CIITLinkComp></Item>'
+        '</Elements></CIITDiagram>'
+        '<InstrumentsData/>'
+        '<RefDesInfoContainer CIR="&amp;ASC#1/test:"><CIRToInfoMap>'
+        '<CIRToInfoMapItem CIRKey="&amp;ASCPR1"><RefDesInfo IRPrefix="&amp;ASCOutProbe" IRNumber="-1"/></CIRToInfoMapItem>'
+        '<CIRToInfoMapItem CIRKey="&amp;ASCPR2"><RefDesInfo IRPrefix="&amp;ASCOutProbe" IRNumber="1"/></CIRToInfoMapItem>'
+        '</CIRToInfoMap></RefDesInfoContainer>'
+        '<RefDesPrefixUsageMap/>'
+        '<TotalProbeTriggers NextProbeID="1"/>'
+        '</Root>'
+    )
+    lib_dir = tmp_path / "lib"
+    struct = lib_dir / parts.STRUCT
+    struct.mkdir(parents=True)
+    (struct / "probe_element.xml").write_text('<Item CiID="10" Class="CiProbeExtComp"><CiProbeExtComp LocalName=""/></Item>', encoding="utf-8")
+    (struct / "probe_symbol.xml").write_text('<Item ID="11" Class="CIITProbeExtComponent"><CIITProbeExtComponent/></Item>', encoding="utf-8")
+    (struct / "probe_instrument.xml").write_text('<CSourceSymbolCollectNode CompLongName=""/>', encoding="utf-8")
+    lib = parts.Library(lib_dir)
+    outputs = sim.add_probes(root, ["vin"], lib, str(tmp_path / "test.ms14"))
+    assert outputs == {"vin": "V(OutProbe2)"}
+
+
+def test_mcp_parts_flag_preserves_force_and_guards_leading_hyphen(monkeypatch, tmp_path):
+    import asyncio
+    from mcp_adapter import server
+    seen = []
+
+    def fake_run_cli(args, timeout_s=300):
+        seen.append(args)
+        return {"ok": True, "status": "PASS", "exit_code": 0, "result": {}}
+
+    monkeypatch.setattr(server, "_run_cli", fake_run_cli)
+    monkeypatch.setenv("MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES", "1")
+    asyncio.run(server.parts("harvest", "design.ms14", force=True))
+    assert "--force" in seen[-1]
+    asyncio.run(server.parts("list", "--force"))
+    assert "--" in seen[-1] and seen[-1].index("--") < seen[-1].index("--force")
+
+
+def test_builder_rename_model_card_updates_named_subckt_ends_only():
+    raw_named = (
+        "* LT macro\r\n"
+        ".SUBCKT LTC6244/LT__OPAMP__1 1 2 3 4 5\r\n"
+        ".MODEL M_INT NMOS(KP=1e-4)\r\n"
+        ".SUBCKT INNER_CELL 1 2\r\n"
+        ".ENDS INNER_CELL\r\n"
+        ".ENDS LTC6244/LT\r\n"
+    )
+    out_named = builder._rename_model_card(raw_named, "LTC6244/LT__OPAMP__1", "LTC6244/LT__OPAMP__2")
+    assert ".SUBCKT LTC6244/LT__OPAMP__2 1 2 3 4 5" in out_named
+    assert ".ENDS LTC6244/LT__OPAMP__2" in out_named
+    assert ".MODEL M_INT NMOS" in out_named
+    assert ".ENDS INNER_CELL" in out_named
+
+    raw_bare = ".SUBCKT Bare__OPAMP__1 1 2\nR1 1 2 1k\n.ENDS\n"
+    out_bare = builder._rename_model_card(raw_bare, "Bare__OPAMP__1", "Bare__OPAMP__2")
+    assert ".SUBCKT Bare__OPAMP__2 1 2" in out_bare
+    assert out_bare.rstrip().endswith(".ENDS")
+
+
+def test_com_analyze_attaches_last_error_message_on_com_exception(tmp_path):
+    from multisimforge import com
+
+    ms14 = tmp_path / "fail.ms14"
+    ms14.write_bytes(b"placeholder")
+
+    class FailingCircuit:
+        LastErrorMessage = "输出未找到。"
+        SimulationState = 0
+
+        def EnumOutputs(self, _):
+            return ("V(OutProbe1)",)
+
+        def DoDCOperatingPoint(self, _):
+            return None
+
+        def OutputReady(self, _):
+            raise RuntimeError("(-2147467259, 'Unspecified error', None, None)")
+
+    class FakeApp:
+        def OpenFile(self, path):
+            return FailingCircuit()
+
+    with pytest.raises(RuntimeError, match=r"op analysis failed:.*LastErrorMessage='输出未找到。'"):
+        com._analyze(FakeApp(), {"ms14": str(ms14), "analyses": [{"type": "op"}]})
+

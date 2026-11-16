@@ -46,12 +46,21 @@ def _probe_point(paths, others, pins):
     return None
 
 
-def net_wires(root):
+def _primary_diagram(root):
+    return next(
+        (d for d in root.iter("CIITDiagram")
+         if d.find("./Elements") is not None and any(c.get("Class") == "CiCircuit" for c in d.find("./Elements"))),
+        root,
+    )
+
+
+def net_wires(root, diagram=None):
     """Return ({net name: [wire polyline, ...]}, set of component pin coordinates); instrument terminals and junctions do not count as component pins."""
+    scope = diagram if diagram is not None else _primary_diagram(root)
     names = {it.get("CiID"): xmlio.unasc(it[0].get("LocalName")).lower()
-             for it in root.iter("Item") if it.get("Class") == "CiNode" and len(it)}
+             for it in scope.iter("Item") if it.get("Class") == "CiNode" and len(it)}
     out = {}
-    for it in root.iter("Item"):
+    for it in scope.iter("Item"):
         if it.get("Class") != "CIITLinkComp" or not len(it):
             continue
         w = it[0]
@@ -60,17 +69,19 @@ def net_wires(root):
             continue
         pts = [(float(p.get("X")), float(p.get("Y"))) for p in w.find("Points")]
         out.setdefault(net, []).append(pts)
-    instruments = {it.get("CiID") for it in root.iter("Item") if it.get("Class") == "CiComponent" and len(it)
+    instruments = {it.get("CiID") for it in scope.iter("Item") if it.get("Class") == "CiComponent" and len(it)
                    and (identity(it[0]) or ("", "", ""))[2] == "instrument"}
     owner = {}                                   # Connector ID → whether it belongs to an instrument
-    for it in root.iter("Item"):
-        if it.get("Class") == "CIITSymbolComp" and len(it):
+    for it in scope.iter("Item"):
+        if it.get("Class") in ("CIITSymbolComp", "CIITAnimationSymbolComp") and len(it):
             is_inst = it[0].get("CiComponent") in instruments
             for c in it.iter("Item"):
                 if c.get("Class") == "CIITPinConnectorComp" and len(c):
-                    owner[c.get("ID")] = is_inst
+                    cid = c.get("ID")
+                    if cid not in owner or it.get("Class") == "CIITSymbolComp":
+                        owner[cid] = is_inst
     pins = set()
-    for it in root.iter("Item"):
+    for it in scope.iter("Item"):
         if it.get("Class") == "CODPinComp" and len(it):
             link = it[0].find("ConnectList/Item")
             if link is not None and link.get("Class") == "CIITPinConnectorComp" and owner.get(link.get("ID")) is False:
@@ -80,11 +91,11 @@ def net_wires(root):
 
 def add_probes(root, nets, lib: Library, ms14_path: str) -> dict:
     """Place voltage probes on the specified nets and return {net: output variable name}."""
-    wires, pins = net_wires(root)
     diagram = next((d for d in root.iter("CIITDiagram") if d.find("./Elements") is not None
                     and any(c.get("Class") == "CiCircuit" for c in d.find("./Elements"))), None)
     if diagram is None:
         raise ValueError("Design has no primary CIITDiagram with a CiCircuit")
+    wires, pins = net_wires(root, diagram=diagram)
     composite = diagram.find("./Components/CODComposite")
     elements = diagram.find("./Elements")
     circuit_item = next(c for c in elements if c.get("Class") == "CiCircuit")
@@ -113,6 +124,14 @@ def add_probes(root, nets, lib: Library, ms14_path: str) -> dict:
     inner_usage = usage.find("RefDesPrefixUsage") if usage is not None else None
     used_slots = {int(nu.get("NumberUsed")) for nu in inner_usage.findall("NumbersUsedVTwo")
                   if nu.get("NumberUsed") is not None} if inner_usage is not None else set()
+    for item in cir_map.findall("CIRToInfoMapItem"):
+        info = item.find("RefDesInfo")
+        if info is not None and xmlio.unasc(info.get("IRPrefix") or "").lower() == "outprobe":
+            try:
+                ir_n = int(info.get("IRNumber") or 0)
+                used_slots.add(0 if ir_n == -1 else max(0, ir_n))
+            except ValueError:
+                pass
     slot = max(used_slots, default=-1) + 1
     outputs = {}
     added_slots = []
@@ -317,9 +336,12 @@ def run(ms14: str, nets: list, op=False, ac=None, tran=None, ac_out=None, ac_in=
             if ac_out and ac_out.lower() in cplx:
                 num = cplx[ac_out.lower()]
                 den = cplx.get((ac_in or "").lower()) or [1] * len(num)
-                if any(abs(v) == 0 for v in den) or all(abs(v) == 0 for v in num):
+                if all(abs(v) == 0 for v in num) or all(abs(v) == 0 for v in den):
                     result.setdefault("warnings", []).append(
                         "AC analysis results are all zero: the signal source needs an AC magnitude (write AC 1 in the netlist, e.g. DC 0 AC 1 SIN(...))")
+                elif any(abs(v) == 0 for v in den):
+                    result.setdefault("warnings", []).append(
+                        f"AC reference net {ac_in!r} has a zero sample; transfer ratio out/in is undefined at that frequency")
                 else:
                     out.update(ac_summary(freq, [a_ / b_ for a_, b_ in zip(num, den)], at))
             result["ac"] = out

@@ -150,6 +150,9 @@ def _request(job: dict, timeout: float) -> dict:
             if cur and cur.get("pid") == proc.pid:
                 try:
                     return _roundtrip(cur, job, timeout)
+                except JobIndeterminate:
+                    _cleanup_orphans(_read_state() or cur)
+                    raise
                 except ComError:
                     raise
                 except (OSError, ValueError):
@@ -365,25 +368,40 @@ def _analyze(app, job):
         names = [n for n in wanted if n in outputs]      # a nonexistent output name makes the analysis fail outright
         if not names:
             raise RuntimeError(f"No readable outputs in the circuit (probes not recognized by Multisim); existing outputs {outputs}")
-        if a["type"] == "op":
-            c.DoDCOperatingPoint(_bstrs(names))
-        elif a["type"] == "ac":
-            sweep = {"dec": 0, "oct": 1, "lin": 2}[a.get("sweep", "dec")]
-            c.DoACSweep(sweep, int(a.get("points", 100)), float(a["start"]), float(a["stop"]), _bstrs(names))
-        elif a["type"] == "tran":
-            if c.SimulationState:
+        try:
+            if a["type"] == "op":
+                c.DoDCOperatingPoint(_bstrs(names))
+            elif a["type"] == "ac":
+                sweep = {"dec": 0, "oct": 1, "lin": 2}[a.get("sweep", "dec")]
+                c.DoACSweep(sweep, int(a.get("points", 100)), float(a["start"]), float(a["stop"]), _bstrs(names))
+            elif a["type"] == "tran":
+                if c.SimulationState:
+                    c.StopSimulation()
+                rate = float(a.get("rate") or 2000 / float(a["time"]))
+                for n in names:
+                    try:
+                        c.ClearOutputRequest(n)
+                    except Exception:
+                        pass
+                    c.SetOutputRequest(n, 2, rate, int(float(a["time"]) * rate) + 1, False)
+                c.RunSimulation(float(a["time"]), False)
+            data, pending = _collect(c, names, float(a.get("timeout", 120)))
+            if a["type"] == "tran" and c.SimulationState:
                 c.StopSimulation()
-            rate = float(a.get("rate") or 2000 / float(a["time"]))
-            for n in names:
+        except Exception as exc:
+            if a.get("type") == "tran":
                 try:
-                    c.ClearOutputRequest(n)
+                    if c.SimulationState:
+                        c.StopSimulation()
                 except Exception:
                     pass
-                c.SetOutputRequest(n, 2, rate, int(float(a["time"]) * rate) + 1, False)
-            c.RunSimulation(float(a["time"]), False)
-        data, pending = _collect(c, names, float(a.get("timeout", 120)))
-        if a["type"] == "tran" and c.SimulationState:
-            c.StopSimulation()
+            try:
+                last_err = _clean(c.LastErrorMessage)
+            except Exception:
+                last_err = ""
+            if last_err:
+                raise RuntimeError(f"{a.get('type')} analysis failed: {exc}; LastErrorMessage={last_err!r}") from exc
+            raise
         pending += [n for n in wanted if n not in outputs]
         results.append({"type": a["type"], "data": data, "missing": pending,
                         "last_error": _clean(c.LastErrorMessage) if pending else ""})

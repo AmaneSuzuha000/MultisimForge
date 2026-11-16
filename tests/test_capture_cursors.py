@@ -70,7 +70,6 @@ def test_open_design_uses_sw_shownoactivate_by_default(tmp_path, monkeypatch):
             return None
 
     monkeypatch.setattr(capture, "_require_capture_deps", lambda: None)
-    monkeypatch.setattr(capture, "design_windows", lambda stem: [(111, 999)])
     monkeypatch.setattr(capture, "design_windows", lambda stem, _calls=[0]: [] if _calls.__setitem__(0, _calls[0] + 1) or _calls[0] == 1 else [(111, 999)])
     monkeypatch.setattr(capture.subprocess, "Popen", lambda argv, startupinfo=None: seen_si.append(startupinfo) or DummyProc())
     monkeypatch.setattr(capture.win32gui, "ShowWindow", lambda h, flag: seen_show.append(flag))
@@ -82,3 +81,20 @@ def test_open_design_uses_sw_shownoactivate_by_default(tmp_path, monkeypatch):
     assert seen_si and seen_si[0] is not None
     assert seen_si[0].wShowWindow == capture.win32con.SW_SHOWNOACTIVATE
     assert seen_show == [], "default capture must not call SW_MAXIMIZE (which activates the window)"
+
+
+def test_close_discovers_main_window_and_cursor_helpers_handle_missing_controls(monkeypatch):
+    if capture.win32con is None:
+        pytest.skip("Windows-only test")
+    posted = []
+    monkeypatch.setattr(capture, "top_windows", lambda pid=None: [(888, "Design [rc]", "MultisimApp", pid)])
+    monkeypatch.setattr(capture.win32api, "PostMessage", lambda h, m, w, l: posted.append((h, m)))
+    monkeypatch.setattr(capture, "_pid_alive", lambda pid: False)
+    capture._close(4242)
+    assert posted == [(888, capture.win32con.WM_CLOSE)]
+
+    monkeypatch.setattr(capture, "_children_by_id", lambda ph: {})
+    sc = capture.position_scope_cursors(888, 1e-3, 2e-3)
+    bd = capture.position_bode_cursor(888, 1000.0)
+    assert sc["verified_by_ui_readout"] is False and sc["warnings"]
+    assert bd["verified_by_ui_readout"] is False and bd["warnings"]

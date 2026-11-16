@@ -174,7 +174,7 @@ def _rewrite_template_for_section(
         return out
     by_len = sorted(rename, key=len, reverse=True)
     # Match both "%t<pin>" and conditional digital pin syntax "?%t:d%t;<pin>"
-    pat = re.compile(r"(%t|\?%t:d%t;)(" + "|".join(re.escape(k) for k in by_len) + r")(?![A-Za-z0-9_+/])")
+    pat = re.compile(r"(%t|\?%t:d%t;)(" + "|".join(re.escape(k) for k in by_len) + r")(?![A-Za-z0-9_+~/\-])")
 
     def sub(m):
         return m.group(1) + rename[m.group(2)]
@@ -198,6 +198,8 @@ def _match_section_pin(
     target_num: int,
     candidates: list[tuple[str, str, str]],
     used: set[str],
+    base_sec: str = "",
+    target_sec: str = "",
 ) -> tuple[str, str] | None:
     """Find the target-section pin corresponding to *old_name* in base section."""
     avail = [(n, num, pt) for n, num, pt in candidates if n not in used]
@@ -210,19 +212,29 @@ def _match_section_pin(
         guess = old_name.replace(b_tok, t_tok)
         if guess in cand_map:
             return cand_map[guess]
-    # 2. Prefix/suffix addition (IN+->2IN+, A->2A)
+    # 2. Section-letter substitution (e.g. +INA->+INB, -INA->-INB, OUTA->OUTB, SHDN_A->SHDN_B)
+    if base_sec and target_sec and base_sec != target_sec:
+        for pat in (
+            rf"({re.escape(base_sec)})$",
+            rf"^({re.escape(base_sec)})",
+            rf"(?<![A-Za-z]){re.escape(base_sec)}(?![A-Za-z])",
+        ):
+            guess, count = re.subn(pat, target_sec, old_name, count=1)
+            if count and guess in cand_map:
+                return cand_map[guess]
+    # 3. Prefix/suffix addition (IN+->2IN+, A->2A)
     for guess in (f"{t_tok}{old_name}", f"{old_name}{t_tok}"):
         if guess in cand_map:
             return cand_map[guess]
-    # 3. Single non-COM pin in section (e.g. MMBD7000LT1: A -> K)
+    # 4. Single non-COM pin in section (e.g. MMBD7000LT1: A -> K)
     if len(avail) == 1:
         return avail[0][0], avail[0][1]
-    # 4. Base stem after stripping section digits
+    # 5. Base stem after stripping section digits
     stem = re.sub(r"\d+", "", old_name)
     stem_hits = [(n, num) for n, num, _pt in avail if re.sub(r"\d+", "", n) == stem]
     if len(stem_hits) == 1:
         return stem_hits[0]
-    # 5. Match ERC type (e.g. D:INPUT vs D:OUTPUT)
+    # 6. Match ERC type (e.g. D:INPUT vs D:OUTPUT)
     if old_type:
         type_hits = [(n, num) for n, num, pt in avail if pt == old_type]
         if len(type_hits) == 1:
@@ -300,7 +312,8 @@ def section_spec(part: ET.Element, section: str = "", lib: "Library | None" = No
                 pin_map[old_name] = pwr_rows[old_name]
             else:
                 matched = _match_section_pin(
-                    old_name, old_types.get(old_name, ""), base_idx + 1, target_idx + 1, target_cands, used
+                    old_name, old_types.get(old_name, ""), base_idx + 1, target_idx + 1,
+                    target_cands, used, base_sec=base_sec, target_sec=sec,
                 )
                 if matched is not None:
                     used.add(matched[0])
@@ -456,6 +469,7 @@ class Library:
         self._part_cache: dict[str, ET.Element] = {}
         self._struct_cache: dict[str, ET.Element] = {}
         self._db_sections_cache: dict | None = None
+        self._db_sections_lower: dict[str, str] = {}
 
     def db_section(self, name: str) -> dict | None:
         if self._db_sections_cache is None:
@@ -467,7 +481,9 @@ class Library:
                     self._db_sections_cache = {}
             else:
                 self._db_sections_cache = {}
-        return self._db_sections_cache.get(name)
+            self._db_sections_lower = {k.lower(): k for k in self._db_sections_cache}
+        key = name if name in self._db_sections_cache else self._db_sections_lower.get(name.lower())
+        return self._db_sections_cache.get(key) if key is not None else None
 
     def save_index(self):
         self.path.mkdir(parents=True, exist_ok=True)
@@ -689,9 +705,12 @@ def _adodb_dbindex_script(db_path: Path, pw: str, out_index: Path, out_sections:
         "                id_to_name[int(cid)] = name\n"
         "                if name not in index:\n"
         "                    index[name] = f\n"
-        "    sym_rows = fetch('SELECT Component_ID, Sec_Order, Pinout_ANSI FROM SYS_MAPPING_COMP_SYMBOL')\n"
-        "    mod_rows = fetch('SELECT Component_ID, Sec_Order, Template FROM SYS_MAPPING_COMP_MODEL')\n"
         "    by_cid = {}\n"
+        "    try:\n"
+        "        sym_rows = fetch('SELECT Component_ID, Sec_Order, Pinout_ANSI FROM SYS_MAPPING_COMP_SYMBOL')\n"
+        "        mod_rows = fetch('SELECT Component_ID, Sec_Order, Template FROM SYS_MAPPING_COMP_MODEL')\n"
+        "    except Exception:\n"
+        "        sym_rows = mod_rows = ()\n"
         "    if sym_rows:\n"
         "        for cid, sec_order, pinout in zip(*sym_rows):\n"
         "            sec_no = int(sec_order or 1)\n"
@@ -722,6 +741,8 @@ def _adodb_dbindex_script(db_path: Path, pw: str, out_index: Path, out_sections:
 
 def build_db_index(lib: Library) -> dict:
     """Read MSCOMP_S.PRD via pure-Python Jet3/4 + ADODB on Windows (Node decoder fallback)."""
+    lib._db_sections_cache = None
+    lib._db_sections_lower = {}
     out = lib.path / "db_index.json"
     out_sections = lib.path / "db_sections.json"
     db_path = Path(CONFIG["master_db"])

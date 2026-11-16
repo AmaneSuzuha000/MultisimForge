@@ -18,9 +18,9 @@ import math
 import re
 from dataclasses import dataclass, field
 
-SUFFIX = {"t": 1e12, "g": 1e9, "meg": 1e6, "k": 1e3, "": 1.0, "m": 1e-3, "u": 1e-6, "µ": 1e-6,
+SUFFIX = {"t": 1e12, "g": 1e9, "meg": 1e6, "k": 1e3, "": 1.0, "m": 1e-3, "u": 1e-6, "µ": 1e-6, "\u03bc": 1e-6,
           "n": 1e-9, "p": 1e-12, "f": 1e-15}
-_MULT = r"meg|[tgkmuµnpf]"
+_MULT = r"meg|[tgkmuµ\u03bcnpf]"
 # Unit words a value may carry without changing it (1kohm, 10mV, 5Hz). Anything else is a typo.
 _UNITS = {"", "ohm", "ohms", "f", "farad", "farads", "h", "henry", "henries", "v", "volt", "volts",
           "a", "amp", "amps", "ampere", "amperes", "w", "watt", "watts", "hz", "s", "sec", "secs",

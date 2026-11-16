@@ -540,7 +540,8 @@ class Builder:
         for model in models:                         # one model per instance, named <name>__<family>__<index> as Multisim does
             m = model[0]
             m.set("Scope", self.circuit_item.get("CiID"))
-            parts = xmlio.unasc(m.get("LocalName")).split("__")
+            raw_local = xmlio.unasc(m.get("LocalName"))
+            parts = raw_local.split("__")
             if len(parts) >= 3:
                 key = tuple(parts[:2])
                 self.model_seq[key] = self.model_seq.get(key, 0) + 1
@@ -549,13 +550,7 @@ class Builder:
                 card = m.find("Attributes/Item/CiaCString")
                 if card is not None:
                     raw_card = xmlio.unasc(card.get("String", ""))
-                    updated_card = re.sub(
-                        r"(?im)^(\s*\.(?:SUBCKT|MODEL)\s+)\S+",
-                        lambda mm, n=new: mm.group(1) + n,
-                        raw_card,
-                        count=1,
-                    )
-                    card.set("String", xmlio.asc(updated_card))
+                    card.set("String", xmlio.asc(_rename_model_card(raw_card, raw_local, new)))
 
         if not ground and (sec_spec is not None or section or int(sym.get("NumSections") or 1) > 1):
             sec_spec = sec_spec or parts_mod.section_spec(part, section or "A", self.lib)
@@ -662,12 +657,14 @@ class Builder:
                     "refdes": display_ref, "direction": pin["direction"], "ground": ground}
             self.connections.setdefault(net, []).append(conn)
             pts.append((conn["x"], conn["y"]))
+        all_pts = [(tx + p["x"], ty + p["y"]) for p in pins.values()] or pts
         if not pts:
-            pts = [(tx + p["x"], ty + p["y"]) for p in pins.values()] or [(tx, ty)]
-        # Routing obstacle box = pin bounds grown by two cells: keeps wires clear of the part body, and both the boundary and the escape points land on the 9-unit grid
-        x0, y0 = min(p[0] for p in pts), min(p[1] for p in pts)
+            pts = all_pts
+        # Routing obstacle box = symbol pin bounds grown by two cells: keeps wires clear of the part body and unconnected pins
+        box_pts = all_pts if not ground else pts
+        x0, y0 = min(p[0] for p in box_pts), min(p[1] for p in box_pts)
         box = {"refdes": display_ref, "x": x0 - 18, "y": y0 - 18,
-               "width": max(p[0] for p in pts) - x0 + 36, "height": max(p[1] for p in pts) - y0 + 36}
+               "width": max(p[0] for p in box_pts) - x0 + 36, "height": max(p[1] for p in box_pts) - y0 + 36}
         self.boxes.append(box)
         self.labels.extend(_label_boxes(sym_item, display_ref))
         self.placements.append({"refdes": display_ref, "part": part_name, "package": pkg_ref, "section": actual_sec or None,
@@ -1148,7 +1145,11 @@ def _repair_variants(spec: dict, limit: int, failing_nets: set[str] | None = Non
                 nets = set(inst.nets) | set(inst.named.values())
                 if nets & failing_nets:
                     ref_u = inst.refdes.upper()
-                    hot_refs.update((ref_u, ref_u.replace(".", ""), ref_u.lstrip("X")))
+                    no_dot = ref_u.replace(".", "")
+                    hot_refs.update((ref_u, no_dot))
+                    for variant in (ref_u, no_dot):
+                        if len(variant) > 1 and variant[0] == "X" and variant[1].isalpha():
+                            hot_refs.add(variant[1:])
             part_targets.sort(key=lambda t: 0 if (t[1].upper() in hot_refs or t[1].upper().replace(".", "") in hot_refs) else 1)
         except Exception:
             pass
@@ -1386,6 +1387,31 @@ def _build_once(spec: dict, lib: Library, allow_fallback: bool, out=None) -> dic
     root, result = _assemble(spec, lib, allow_fallback, out=out)
     _write_atomic(root, Path(result["ms14"]), result["run_id"])
     return result
+
+
+def _rename_model_card(raw_card: str, raw_local: str, new: str) -> str:
+    """Rename a SPICE .MODEL/.SUBCKT header and any matching outer .ENDS trailer."""
+    hdr = re.search(r"(?im)^(\s*\.(?:SUBCKT|MODEL)\s+)(\S+)", raw_card)
+    updated = re.sub(
+        r"(?im)^(\s*\.(?:SUBCKT|MODEL)\s+)\S+",
+        lambda mm, n=new: mm.group(1) + n,
+        raw_card,
+        count=1,
+    )
+    if hdr and hdr.group(1).lstrip().upper().startswith(".SUBCKT"):
+        base = raw_local.split("__", 1)[0]
+        ends_toks = sorted(
+            {t for t in (hdr.group(2), raw_local, base) if t},
+            key=len,
+            reverse=True,
+        )
+        ends_alt = "|".join(re.escape(t) for t in ends_toks)
+        updated = re.sub(
+            rf"(?im)^(\s*\.ENDS\s+)(?:{ends_alt})(?=\s|$)",
+            lambda mm, n=new: mm.group(1) + n,
+            updated,
+        )
+    return updated
 
 
 def set_sim_time(ms14, sim_time: float):

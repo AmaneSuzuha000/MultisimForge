@@ -46,12 +46,20 @@ def symbol_bbox(sym_item):
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def _primary_diagram(root):
+    return next(
+        (d for d in root.iter("CIITDiagram")
+         if d.find("./Elements") is not None and any(e.get("Class") == "CiCircuit" for e in d.find("./Elements"))),
+        next(root.iter("CIITDiagram"), None),
+    )
+
+
 class Circuit:
     """Read-only view of a .ms14 primary schematic: components, ports, nets, wires, and graphical connectivity."""
 
     def __init__(self, root, diagram=None):
         self.root = root
-        self.diagram = diagram if diagram is not None else next(root.iter("CIITDiagram"), None)
+        self.diagram = diagram if diagram is not None else _primary_diagram(root)
         scope = self.diagram if self.diagram is not None else root
         self.items = {}
         for it in scope.iter("Item"):
@@ -103,7 +111,13 @@ class Circuit:
             return name
         if self.comp_is_multisection(comp_id):
             sec = self.comp_section(comp_id)
-            if sec and not name.endswith(sec):
+            already_suffixed = (
+                self._name_counts.get(name, 0) == 1
+                and len(name) > 2
+                and name[-2].isdigit()
+                and name.endswith(sec)
+            )
+            if sec and not already_suffixed:
                 return name + sec
         return name
 
@@ -216,7 +230,7 @@ class Circuit:
 
 
 def check_root(root, expected: dict | None = None, source="<memory>") -> dict:
-    diagram = next(root.iter("CIITDiagram"), None)
+    diagram = _primary_diagram(root)
     if diagram is None:
         raise ValueError(f"not a Multisim circuit: {source} has no CIITDiagram element")
     c = Circuit(root, diagram=diagram)

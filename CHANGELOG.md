@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-11-17
+
+Fresh-perspective deep audit and hardening pass across netlist parsing, multi-section parts resolution,
+SPICE/COM diagnostics, schematic checking/probing, Win32 background capture, and MCP CLI forwarding.
+
+### Fixed
+
+- **Parts & multi-section resolution (`parts.py`, `netlist.py`, `builder.py`):**
+  - Accepted Greek small mu (`\u03bc`, e.g. `"4.7μ"`, `"10μs"`) in `netlist.py` SI suffixes (`SUFFIX`/`_MULT`).
+  - Resolved section-letter pin names (`+INA`/`-INA`/`OUTA` -> `+INB`/`-INB`/`OUTB`, as on
+    `LTC6244CDD`, `CD4538BCN`, and `THS7002`) before ERC-type fallback in `_match_section_pin`, and
+    aligned `_rewrite_template_for_section` token boundaries with `_template_tokens`.
+  - Made `Library.db_section` lookup case-insensitive, invalidated `_db_sections_cache` on
+    `build_db_index`, and guarded optional `SYS_MAPPING_COMP_*` ADODB queries in `_adodb_dbindex_script`.
+  - Extracted `_rename_model_card` in `builder.py` to update named outer `.ENDS` trailers matching a
+    renamed `.SUBCKT` header while preserving bare `.ENDS` and nested `.MODEL`/`.SUBCKT` cards;
+    fixed `_repair_variants` `hot_refs` to strip only a single leading `X`; included unconnected
+    pins in partial IC obstacle bounding boxes during `Builder.place`.
+- **Checking, probing & simulation diagnostics (`check.py`, `sim.py`, `com.py`):**
+  - Scoped diagram selection (`_primary_diagram`) consistently across `check.py` and `sim.net_wires`,
+    recognized `CIITAnimationSymbolComp` pins in `sim.net_wires`, scanned `CIRToInfoMap` for existing
+    `OutProbe<N>` slots in `add_probes`, fixed `Circuit.comp_label` for short letter-ending package
+    names (`QA` + section `A` -> `QAA`), and separated zero `ac_in` denominator warnings in `sim.run`.
+  - Cleaned up newly spawned Multisim orphans on `JobIndeterminate` retries in `com._request` and
+    attached non-empty `LastErrorMessage` diagnostics when COM analysis or output collection fails
+    in `com._analyze`.
+- **Capture & MCP adapter (`capture.py`, `mcp_adapter/server.py`):**
+  - Added `ZeroDivisionError` guards and single-cursor `--cur1` `T2` restoration in
+    `position_scope_cursors`, guarded missing Win32 panel child controls (`1050`/`10015`), and
+    auto-discovered the `Multisim` main HWND in `_close(pid, main=None)` for clean `WM_CLOSE` exit.
+  - Restored `--force` forwarding in `mcp_adapter.server.parts` and inserted `--` before
+    hyphen-prefixed positional args in `list_sections` and `parts`.
+
 ## [0.1.7] - 2026-11-12
 
 Reliability, multi-section packages, zero-Node ADODB database indexing, and closed-loop

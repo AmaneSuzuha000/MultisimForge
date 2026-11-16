@@ -31,7 +31,7 @@ for sub in ("specs", "captures", "tmp"):
 mcp = MCPServer(
     "multisimforge",
     title="MultisimForge",
-    version="0.1.7",
+    version="0.1.8",
     instructions=(
         "MultisimForge adapter for NI Multisim 14.3. Use check_design for offline "
         "connectivity/layout verification, inspect_design to read an existing .ms14, "
@@ -282,7 +282,11 @@ async def build_schematic(spec: dict[str, Any], preview_png: str = "") -> dict[s
 @mcp.tool()
 async def list_sections(ms14: str, package_ref: str) -> dict[str, Any]:
     """Read sections used by one native Multisim package; does not construct new sections."""
-    return await asyncio.to_thread(_run_cli, ["sections", str(_resolve(ms14)), package_ref])
+    args = ["sections", str(_resolve(ms14))]
+    if str(package_ref).startswith("-"):
+        args.append("--")
+    args.append(package_ref)
+    return await asyncio.to_thread(_run_cli, args)
 
 
 @mcp.tool()
@@ -413,14 +417,17 @@ async def parts(action: Literal["list", "show", "harvest", "fetch", "init", "dbi
     if action not in ("list", "show") and os.environ.get("MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES") != "1":
         return _blocked_reply("MCP part-library mutations are disabled; set MULTISIMFORGE_MCP_ALLOW_LIBRARY_WRITES=1 to enable them")
     args = ["parts", action]
-    if arg:
-        args.append(str(_resolve(arg)) if action == "harvest" else arg)
     if force:
         args.append("--force")
     if group:
         args += ["--group", group]
     if family:
         args += ["--family", family]
+    if arg:
+        val = str(_resolve(arg)) if action == "harvest" else str(arg)
+        if val.startswith("-"):
+            args.append("--")
+        args.append(val)
     return await asyncio.to_thread(_run_cli, args, 900)
 
 
